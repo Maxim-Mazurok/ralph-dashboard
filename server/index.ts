@@ -64,20 +64,6 @@ function quantile(values: number[], percentile: number): number | null {
   return sorted[Math.min(sorted.length - 1, Math.floor(percentile * sorted.length))]
 }
 
-function canonicalCycles(cycles: Cycle[]): Cycle[] {
-  const statusPriority: Record<Cycle['status'], number> = { incomplete: 0, complete: 1, active: 2 }
-  const byNumber = new Map<number, Cycle>()
-  for (const candidate of cycles) {
-    const current = byNumber.get(candidate.cycle)
-    if (!current
-      || statusPriority[candidate.status] > statusPriority[current.status]
-      || (candidate.status === current.status && candidate.startedAt > current.startedAt)) {
-      byNumber.set(candidate.cycle, candidate)
-    }
-  }
-  return [...byNumber.values()].sort((a, b) => a.cycle - b.cycle)
-}
-
 async function loadCycle(entryName: string, activeDirectory: string | null): Promise<Cycle | null> {
   const match = cyclePattern.exec(entryName)
   if (!match) return null
@@ -165,7 +151,7 @@ function canonicalCycles(cycles: Cycle[]): Cycle[] {
     const current = canonical.get(cycle.cycle)
     if (!current
       || statusRank[cycle.status] > statusRank[current.status]
-      || (statusRank[cycle.status] === statusRank[current.status] && cycle.startedAt > current.startedAt)) {
+      || (cycle.status === current.status && cycle.startedAt > current.startedAt)) {
       canonical.set(cycle.cycle, cycle)
     }
   }
