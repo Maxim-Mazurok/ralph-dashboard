@@ -64,6 +64,20 @@ function quantile(values: number[], percentile: number): number | null {
   return sorted[Math.min(sorted.length - 1, Math.floor(percentile * sorted.length))]
 }
 
+function canonicalCycles(cycles: Cycle[]): Cycle[] {
+  const statusPriority: Record<Cycle['status'], number> = { incomplete: 0, complete: 1, active: 2 }
+  const byNumber = new Map<number, Cycle>()
+  for (const candidate of cycles) {
+    const current = byNumber.get(candidate.cycle)
+    if (!current
+      || statusPriority[candidate.status] > statusPriority[current.status]
+      || (candidate.status === current.status && candidate.startedAt > current.startedAt)) {
+      byNumber.set(candidate.cycle, candidate)
+    }
+  }
+  return [...byNumber.values()].sort((a, b) => a.cycle - b.cycle)
+}
+
 async function loadCycle(entryName: string, activeDirectory: string | null): Promise<Cycle | null> {
   const match = cyclePattern.exec(entryName)
   if (!match) return null
@@ -144,16 +158,31 @@ async function listStreams(): Promise<Artifact[]> {
   }))
 }
 
+function canonicalCycles(cycles: Cycle[]): Cycle[] {
+  const statusRank: Record<Cycle['status'], number> = { incomplete: 0, complete: 1, active: 2 }
+  const canonical = new Map<number, Cycle>()
+  for (const cycle of cycles) {
+    const current = canonical.get(cycle.cycle)
+    if (!current
+      || statusRank[cycle.status] > statusRank[current.status]
+      || (statusRank[cycle.status] === statusRank[current.status] && cycle.startedAt > current.startedAt)) {
+      canonical.set(cycle.cycle, cycle)
+    }
+  }
+  return [...canonical.values()]
+}
+
 async function loadDashboard() {
   const state = await readJson(path.join(runtimeRoot, 'state.json'))
   const active = state?.active as JsonObject | undefined
   const activeDirectory = active ? text(active.directory) : null
   const directoryEntries = await readdir(runtimeRoot, { withFileTypes: true })
-  const cycles = (await Promise.all(directoryEntries
+  const cycleDirectories = (await Promise.all(directoryEntries
     .filter((entry) => entry.isDirectory() && cyclePattern.test(entry.name))
     .map((entry) => loadCycle(entry.name, activeDirectory))))
     .filter((cycle): cycle is Cycle => cycle !== null)
     .sort((a, b) => a.cycle - b.cycle || a.startedAt.localeCompare(b.startedAt))
+  const cycles = canonicalCycles(cycleDirectories)
 
   const complete = cycles.filter((cycle) => cycle.status === 'complete')
   const durations = complete.flatMap((cycle) => cycle.durationMs === null ? [] : [cycle.durationMs])
@@ -167,7 +196,8 @@ async function loadDashboard() {
 
   const history = await readJsonLines(path.join(ralphRoot, 'history.jsonl'))
   const loopCompletions = history.filter((entry) => (entry.type as JsonObject | undefined)?.kind === 'loop_completed')
-  const failedLoops = loopCompletions.filter((entry) => text((entry.type as JsonObject).reason) !== 'completed')
+  const failureReasons = new Set(['consecutive_failures', 'loop_stale'])
+  const failedLoops = loopCompletions.filter((entry) => failureReasons.has(text((entry.type as JsonObject).reason)))
 
   return {
     project: { name: path.basename(projectRoot), path: projectRoot, ralphPath: ralphRoot },
@@ -178,6 +208,8 @@ async function loadDashboard() {
       completedCycles: complete.length,
       retryRate: cycles.length ? cycles.filter((cycle) => cycle.retryCount > 0).length / cycles.length : 0,
       loopFailureRate: loopCompletions.length ? failedLoops.length / loopCompletions.length : 0,
+      loopRuns: loopCompletions.length,
+      failedLoops: failedLoops.length,
       medianCycleMs: quantile(durations, 0.5),
       p90CycleMs: quantile(durations, 0.9),
       phaseShare: Object.fromEntries(Object.entries(phaseTotals).map(([role, value]) => [role, measuredPhaseTime ? value / measuredPhaseTime : 0])),
