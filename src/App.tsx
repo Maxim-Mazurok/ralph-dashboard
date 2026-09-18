@@ -100,11 +100,12 @@ function App() {
   if (!data) return <main className="loading error"><AlertTriangle /> {error}<button onClick={() => void load()}>Retry</button></main>
 
   const visibleCycles = data.cycles.slice(range === 0 ? 0 : -range)
-  const timingData = visibleCycles.map((cycle) => ({
+  const measuredCycles = visibleCycles.filter((cycle) => cycle.status === 'complete')
+  const timingData = measuredCycles.map((cycle) => ({
     cycle: `#${cycle.cycle}`,
     total: cycle.durationMs ? Math.round(cycle.durationMs / 60000) : null,
   }))
-  const phaseTrend = visibleCycles.map((cycle) => {
+  const phaseTrend = measuredCycles.map((cycle) => {
     const values = Object.fromEntries((Object.keys(phaseColors) as PhaseName[]).map((phase) => [phase, cycle.phases[phase].durationMs || 0])) as Record<PhaseName, number>
     const total = values.worker + values.reviewer + values.retrospective
     return { cycle: `#${cycle.cycle}`, ...Object.fromEntries((Object.keys(values) as PhaseName[]).map((phase) => [phase, total ? Math.round(values[phase] / total * 100) : 0])) }
