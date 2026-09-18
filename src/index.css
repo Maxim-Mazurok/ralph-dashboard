@@ -1,0 +1,19 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap');
+
+:root {
+  font-family: 'Manrope', sans-serif;
+  color: #1c2526;
+  background: #e9e8e1;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --ink: #1c2526;
+  --muted: #68716f;
+  --paper: #f7f6f0;
+  --line: #d1d2cb;
+  --blue: #1f4e5f;
+  --rust: #d65a31;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input { font: inherit; }
+button { color: inherit; }
