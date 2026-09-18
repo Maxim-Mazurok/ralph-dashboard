@@ -41,19 +41,6 @@ async function readJson(file: string): Promise<JsonObject | null> {
   }
 }
 
-async function readJsonLines(file: string): Promise<JsonObject[]> {
-  try {
-    return (await readFile(file, 'utf8'))
-      .split('\n')
-      .filter(Boolean)
-      .flatMap((line) => {
-        try { return [JSON.parse(line) as JsonObject] } catch { return [] }
-      })
-  } catch {
-    return []
-  }
-}
-
 function text(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback
 }
@@ -180,10 +167,7 @@ async function loadDashboard() {
   }
   const measuredPhaseTime = Object.values(phaseTotals).reduce((sum, value) => sum + value, 0)
 
-  const history = await readJsonLines(path.join(ralphRoot, 'history.jsonl'))
-  const loopCompletions = history.filter((entry) => (entry.type as JsonObject | undefined)?.kind === 'loop_completed')
-  const failureReasons = new Set(['consecutive_failures', 'loop_stale'])
-  const failedLoops = loopCompletions.filter((entry) => failureReasons.has(text((entry.type as JsonObject).reason)))
+  const changedCycles = complete.filter((cycle) => cycle.outcome === 'change').length
 
   return {
     project: { name: path.basename(projectRoot), path: projectRoot, ralphPath: ralphRoot },
@@ -193,9 +177,8 @@ async function loadDashboard() {
       totalCycles: cycles.length,
       completedCycles: complete.length,
       retryRate: cycles.length ? cycles.filter((cycle) => cycle.retryCount > 0).length / cycles.length : 0,
-      loopFailureRate: loopCompletions.length ? failedLoops.length / loopCompletions.length : 0,
-      loopRuns: loopCompletions.length,
-      failedLoops: failedLoops.length,
+      changeRate: complete.length ? changedCycles / complete.length : 0,
+      changedCycles,
       medianCycleMs: quantile(durations, 0.5),
       p90CycleMs: quantile(durations, 0.9),
       phaseShare: Object.fromEntries(Object.entries(phaseTotals).map(([role, value]) => [role, measuredPhaseTime ? value / measuredPhaseTime : 0])),

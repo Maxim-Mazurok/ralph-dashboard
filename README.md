@@ -58,7 +58,7 @@ Open `http://localhost:4310`. Set `PORT` to change the Express port.
 - Cycle elapsed time runs from the millisecond timestamp in the cycle directory name to the latest completion artifact.
 - Worker, reviewer, and retrospective time is inferred from each attempt prompt's modification time through its log's modification time.
 - "Needed retry" counts extra role attempts and feedback artifacts.
-- Legacy run failure rate counts `consecutive_failures` and `loop_stale` termination reasons in `.ralph/history.jsonl`. Normal `completion_promise` and bounded `max_iterations` terminations are not failures. This stream predates the current coordinator, so the UI labels the metric accordingly.
+- Change outcome rate is the share of completed current-harness cycles whose accepted outcome is `change`, rather than `investigation` or `no_change`.
 
 Filesystem-derived timings are marked approximate in the UI. They are useful for trends and workflow comparisons, but are not billing-grade telemetry.
 

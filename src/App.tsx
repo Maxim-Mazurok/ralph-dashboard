@@ -133,7 +133,7 @@ function App() {
         <Metric icon={CheckCircle2} label="Completed" value={`${data.metrics.completedCycles}`} note={`${data.metrics.totalCycles} cycle directories`} />
         <Metric icon={Clock3} label="Median cycle" value={duration(data.metrics.medianCycleMs)} note={`P90 ${duration(data.metrics.p90CycleMs)} · approx.`} />
         <Metric icon={TimerReset} label="Needed retry" value={percent(data.metrics.retryRate)} note="Retries or feedback artifacts" />
-        <Metric icon={AlertTriangle} label="Legacy run failures" value={percent(data.metrics.loopFailureRate)} note={`${data.metrics.failedLoops} of ${data.metrics.loopRuns} recorded terminations`} />
+        <Metric icon={Activity} label="Change outcomes" value={percent(data.metrics.changeRate)} note={`${data.metrics.changedCycles} of ${data.metrics.completedCycles} completed cycles`} />
       </section>
 
       <div className="section-bar"><div><h2>Time & throughput</h2><p>Role timings use prompt and log filesystem timestamps.</p></div><div className="segmented" aria-label="Cycle range">

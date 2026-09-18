@@ -32,9 +32,8 @@ export type DashboardData = {
     totalCycles: number
     completedCycles: number
     retryRate: number
-    loopFailureRate: number
-    loopRuns: number
-    failedLoops: number
+    changeRate: number
+    changedCycles: number
     medianCycleMs: number | null
     p90CycleMs: number | null
     phaseShare: Record<PhaseName, number>
