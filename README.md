@@ -36,7 +36,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. Vite serves the React UI and proxies API requests to Express on port `4310`.
+Vite listens on all network interfaces. Open `http://localhost:5173` on this machine or `http://<computer-lan-ip>:5173` from another device on the local network. It proxies API requests to Express on port `4310`.
 
 The default observed project is `/home/user/home-inventory`. Point the API at another compatible repository with:
 
@@ -51,7 +51,10 @@ npm run build
 npm start
 ```
 
-Open `http://localhost:4310`. Set `PORT` to change the Express port.
+Express also listens on all interfaces by default. Open `http://<computer-lan-ip>:4310` from another device. Set `HOST` or `PORT` to override the default `0.0.0.0:4310` binding.
+
+> [!WARNING]
+> This dashboard has no authentication and exposes Ralph logs and artifacts, which may contain source code, paths, prompts, or command output. Use it only on a trusted local network and do not expose these ports to the public internet.
 
 ## Metrics
 

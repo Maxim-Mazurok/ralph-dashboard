@@ -5,6 +5,7 @@ import path from 'node:path'
 
 const app = express()
 const port = Number(process.env.PORT || 4310)
+const host = process.env.HOST || '0.0.0.0'
 const projectRoot = path.resolve(process.env.RALPH_PROJECT_PATH || '/home/user/home-inventory')
 const ralphRoot = path.join(projectRoot, '.ralph')
 const runtimeRoot = path.join(ralphRoot, 'runtime')
@@ -330,8 +331,8 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
 })
 
 if (process.env.NODE_ENV !== 'test') {
-  app.listen(port, () => {
-    console.log(`Ralph dashboard: http://localhost:${port}`)
+  app.listen(port, host, () => {
+    console.log(`Ralph dashboard listening on http://${host}:${port}`)
     console.log(`Reading: ${ralphRoot}`)
   })
 }
