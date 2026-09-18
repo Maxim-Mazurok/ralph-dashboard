@@ -11,10 +11,12 @@ const runtimeRoot = path.join(ralphRoot, 'runtime')
 const cyclePattern = /^cycle-(\d+)-(\d+)$/
 const attemptPattern = /^(worker|reviewer|retrospective)-(\d+)\.(md|log)$/
 const textExtensions = new Set(['.json', '.jsonl', '.log', '.md', '.txt'])
+const liveLogLimit = 256 * 1024
 
 type JsonObject = Record<string, unknown>
 type Artifact = { name: string; size: number; modifiedAt: string; kind: string }
 type PhaseTiming = { durationMs: number | null; attempts: number }
+type ActiveLog = { cycle: number; directory: string; file: string; phase: string; attempt: number }
 
 type Cycle = {
   id: string
@@ -49,6 +51,38 @@ function quantile(values: number[], percentile: number): number | null {
   if (!values.length) return null
   const sorted = [...values].sort((a, b) => a - b)
   return sorted[Math.min(sorted.length - 1, Math.floor(percentile * sorted.length))]
+}
+
+async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null> {
+  const active = state?.active as JsonObject | undefined
+  const pending = state?.pendingRetrospective as JsonObject | undefined
+  const directory = text(active?.directory, text(pending?.directory))
+  if (!directory || path.dirname(directory) !== runtimeRoot || !cyclePattern.test(path.basename(directory))) return null
+
+  const preferredPhase = text(active?.phase, pending ? 'retrospective' : '')
+  const preferredAttempt = Number(active?.attempt ?? pending?.attempt ?? 0)
+  const files = await readdir(directory, { withFileTypes: true })
+  const logs = await Promise.all(files.flatMap((entry) => {
+    const match = entry.isFile() ? attemptPattern.exec(entry.name) : null
+    if (!match || match[3] !== 'log') return []
+    return [stat(path.join(directory, entry.name)).then((details) => ({
+      file: entry.name,
+      phase: match[1],
+      attempt: Number(match[2]),
+      modifiedMs: details.mtimeMs,
+    }))]
+  }))
+  if (!logs.length) return null
+  const preferred = logs.find((log) => log.phase === preferredPhase && log.attempt === preferredAttempt)
+  const selected = preferred || logs.sort((left, right) => right.modifiedMs - left.modifiedMs)[0]
+  const directoryMatch = cyclePattern.exec(path.basename(directory))
+  return {
+    cycle: Number((active?.cycle ?? pending?.cycle) || directoryMatch?.[1] || 0),
+    directory,
+    file: selected.file,
+    phase: selected.phase,
+    attempt: selected.attempt,
+  }
 }
 
 async function loadCycle(entryName: string, activeDirectory: string | null): Promise<Cycle | null> {
@@ -148,6 +182,7 @@ function canonicalCycles(cycles: Cycle[]): Cycle[] {
 async function loadDashboard() {
   const state = await readJson(path.join(runtimeRoot, 'state.json'))
   const active = state?.active as JsonObject | undefined
+  const activeLog = await findActiveLog(state)
   const activeDirectory = active ? text(active.directory) : null
   const directoryEntries = await readdir(runtimeRoot, { withFileTypes: true })
   const cycleDirectories = (await Promise.all(directoryEntries
@@ -172,7 +207,12 @@ async function loadDashboard() {
   return {
     project: { name: path.basename(projectRoot), path: projectRoot, ralphPath: ralphRoot },
     generatedAt: new Date().toISOString(),
-    active: active ? { phase: text(active.phase), attempt: Number(active.attempt || 1), cycle: Number(active.cycle || cycles.at(-1)?.cycle || 0) } : null,
+    active: active ? {
+      phase: text(active.phase, activeLog?.phase),
+      attempt: Number(active.attempt || activeLog?.attempt || 1),
+      cycle: Number(active.cycle || activeLog?.cycle || cycles.at(-1)?.cycle || 0),
+      logFile: activeLog?.file || null,
+    } : null,
     metrics: {
       totalCycles: cycles.length,
       completedCycles: complete.length,
@@ -223,6 +263,65 @@ app.get('/api/stream', async (request, response, next) => {
   } catch (error) { next(error) }
 })
 
+app.get('/api/live-log', async (request, response) => {
+  response.set({
+    'Cache-Control': 'no-cache, no-transform',
+    'Content-Type': 'text/event-stream',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  })
+  response.flushHeaders()
+
+  let lastSignature = ''
+  let reading = false
+  const sendUpdate = async () => {
+    if (reading || response.writableEnded) return
+    reading = true
+    try {
+      const state = await readJson(path.join(runtimeRoot, 'state.json'))
+      const activeLog = await findActiveLog(state)
+      if (!activeLog) {
+        if (lastSignature !== 'idle') {
+          response.write(`event: idle\ndata: ${JSON.stringify({ active: false })}\n\n`)
+          lastSignature = 'idle'
+        }
+        return
+      }
+
+      const filename = path.join(activeLog.directory, activeLog.file)
+      const details = await stat(filename)
+      const signature = `${filename}:${details.size}:${details.mtimeMs}`
+      if (signature === lastSignature) return
+      const contents = await readFile(filename)
+      const tail = contents.subarray(Math.max(0, contents.length - liveLogLimit)).toString('utf8')
+      response.write(`event: log\ndata: ${JSON.stringify({
+        active: true,
+        cycle: activeLog.cycle,
+        phase: activeLog.phase,
+        attempt: activeLog.attempt,
+        file: activeLog.file,
+        content: tail,
+        size: details.size,
+        truncated: contents.length > liveLogLimit,
+        updatedAt: details.mtime.toISOString(),
+      })}\n\n`)
+      lastSignature = signature
+    } catch (error) {
+      response.write(`event: stream-error\ndata: ${JSON.stringify({ message: error instanceof Error ? error.message : 'Unable to read active log' })}\n\n`)
+    } finally {
+      reading = false
+    }
+  }
+
+  await sendUpdate()
+  const refresh = setInterval(() => void sendUpdate(), 1000)
+  const heartbeat = setInterval(() => response.write(': keepalive\n\n'), 15000)
+  request.on('close', () => {
+    clearInterval(refresh)
+    clearInterval(heartbeat)
+  })
+})
+
 app.use(express.static(path.join(import.meta.dirname, '..', 'dist')))
 app.get('/{*path}', (_request, response) => response.sendFile(path.join(import.meta.dirname, '..', 'dist', 'index.html')))
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
@@ -230,7 +329,11 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
   response.status(500).json({ error: error instanceof Error ? error.message : 'Unexpected error' })
 })
 
-app.listen(port, () => {
-  console.log(`Ralph dashboard: http://localhost:${port}`)
-  console.log(`Reading: ${ralphRoot}`)
-})
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(port, () => {
+    console.log(`Ralph dashboard: http://localhost:${port}`)
+    console.log(`Reading: ${ralphRoot}`)
+  })
+}
+
+export { app }

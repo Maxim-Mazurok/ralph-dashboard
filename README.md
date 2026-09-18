@@ -25,6 +25,7 @@ This project is AI-generated and was not human-made. GitHub Copilot designed and
 - Worker, reviewer, and retrospective time split and change over time
 - Outcome distribution, retry rate, and loop failure rate
 - Active and incomplete cycle state
+- Live streaming of the active worker, reviewer, or retrospective log with automatic phase rollover and ANSI terminal colors
 - Searchable per-cycle reports, prompts, logs, feedback, and JSON artifacts
 - Raw loop history and iteration event streams
 

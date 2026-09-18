@@ -15,9 +15,11 @@
     "start": "tsx server/index.ts",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test": "tsx --test server/index.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
+    "ansi-to-html": "^0.7.2",
     "express": "^5.2.1",
     "lucide-react": "^1.47.0",
     "react": "^19.2.8",

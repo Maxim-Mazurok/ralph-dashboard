@@ -1,7 +1,8 @@
-import { startTransition, useDeferredValue, useEffect, useState } from 'react'
+import { startTransition, useDeferredValue, useEffect, useRef, useState } from 'react'
+import Convert from 'ansi-to-html'
 import {
   Activity, AlertTriangle, Archive, BarChart3, CheckCircle2, Clock3,
-  FileText, FolderOpen, RefreshCw, Search, TimerReset, X,
+  FileText, FolderOpen, Pause, Play, Radio, RefreshCw, Search, TimerReset, X,
 } from 'lucide-react'
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Line,
@@ -40,6 +41,74 @@ function Metric({ label, value, note, icon: Icon }: { label: string; value: stri
 }
 function EmptyChart() { return <div className="empty-chart">Not enough measured data yet</div> }
 
+const ansiConverter = new Convert({
+  bg: '#101719',
+  fg: '#d8e2df',
+  newline: true,
+  escapeXML: true,
+})
+
+function terminalHtml(content: string): string {
+  return ansiConverter.toHtml(content.replace(/\r(?!\n)/g, '\n'))
+}
+
+type LiveLogUpdate = {
+  active: boolean
+  cycle: number
+  phase: string
+  attempt: number
+  file: string
+  content: string
+  size: number
+  truncated: boolean
+  updatedAt: string
+}
+
+function LiveLogDrawer({ onClose }: { onClose: () => void }) {
+  const [update, setUpdate] = useState<LiveLogUpdate | null>(null)
+  const [status, setStatus] = useState<'connecting' | 'live' | 'idle' | 'error'>('connecting')
+  const [following, setFollowing] = useState(true)
+  const outputRef = useRef<HTMLPreElement>(null)
+
+  useEffect(() => {
+    const source = new EventSource('/api/live-log')
+    source.addEventListener('log', (event) => {
+      setUpdate(JSON.parse((event as MessageEvent<string>).data) as LiveLogUpdate)
+      setStatus('live')
+    })
+    source.addEventListener('idle', () => setStatus('idle'))
+    source.addEventListener('stream-error', () => setStatus('error'))
+    source.onerror = () => setStatus('error')
+    return () => source.close()
+  }, [])
+
+  useEffect(() => {
+    if (following && outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight
+  }, [following, update?.content])
+
+  return <div className="drawer-backdrop" onMouseDown={onClose}>
+    <aside className="drawer live-drawer" onMouseDown={(event) => event.stopPropagation()}>
+      <header>
+        <div><Radio size={18} /><strong>{update ? `Cycle ${update.cycle} · ${update.phase} ${update.attempt}` : 'Active cycle log'}</strong><span className={`live-state ${status}`}>{status}</span></div>
+        <div className="drawer-actions">
+          <button className="follow-button" title={following ? 'Pause auto-scroll' : 'Resume auto-scroll'} onClick={() => setFollowing((current) => !current)}>{following ? <Pause size={15} /> : <Play size={15} />}{following ? 'Following' : 'Paused'}</button>
+          <button className="icon-button" title="Close live log" onClick={onClose}><X size={18} /></button>
+        </div>
+      </header>
+      <div className="live-meta">
+        <span>{update?.file || 'Waiting for an active role log…'}</span>
+        {update && <span>{bytes(update.size)} · {date(update.updatedAt)}{update.truncated ? ' · latest 256 KB' : ''}</span>}
+      </div>
+      <pre
+        ref={outputRef}
+        dangerouslySetInnerHTML={{
+          __html: terminalHtml(update?.content || (status === 'idle' ? 'No active cycle log.' : status === 'error' ? 'Connection interrupted. Reconnecting…' : 'Connecting to active cycle…')),
+        }}
+      />
+    </aside>
+  </div>
+}
+
 function App() {
   const [data, setData] = useState<DashboardData | null>(null)
   const [error, setError] = useState('')
@@ -49,6 +118,7 @@ function App() {
   const deferredQuery = useDeferredValue(query)
   const [selectedCycleId, setSelectedCycleId] = useState('')
   const [artifact, setArtifact] = useState<{ title: string; content: string } | null>(null)
+  const [liveLogOpen, setLiveLogOpen] = useState(false)
 
   async function load(showRefreshing = true) {
     if (showRefreshing) setRefreshing(true)
@@ -119,6 +189,7 @@ function App() {
       <div className="brand-mark"><BarChart3 size={20} /></div>
       <div className="brand"><strong>Ralph Observatory</strong><span>{data.project.name}</span></div>
       <div className="source"><span className={data.active ? 'pulse' : 'dot'} />{data.active ? `Cycle ${data.active.cycle} · ${data.active.phase}` : 'Loop idle'}</div>
+      <button className="live-button" onClick={() => setLiveLogOpen(true)} disabled={!data.active}><Radio size={15} />Live log</button>
       <button className="icon-button" title="Refresh data" onClick={() => void load()} disabled={refreshing}><RefreshCw size={17} className={refreshing ? 'spin' : ''} /></button>
     </header>
 
@@ -191,6 +262,7 @@ function App() {
     </main>
 
     <footer>Updated {date(data.generatedAt)} · Filesystem timings are approximate · Read-only access</footer>
+    {liveLogOpen && <LiveLogDrawer onClose={() => setLiveLogOpen(false)} />}
     {artifact && <div className="drawer-backdrop" onMouseDown={() => setArtifact(null)}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><header><div><FileText size={18} /><strong>{artifact.title}</strong></div><button className="icon-button" title="Close viewer" onClick={() => setArtifact(null)}><X size={18} /></button></header><pre>{artifact.content}</pre></aside></div>}
   </div>
 }
