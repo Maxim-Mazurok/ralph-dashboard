@@ -56,6 +56,10 @@ Express also listens on all interfaces by default. Open `http://<computer-lan-ip
 > [!WARNING]
 > This dashboard has no authentication and exposes Ralph logs and artifacts, which may contain source code, paths, prompts, or command output. Use it only on a trusted local network and do not expose these ports to the public internet.
 
+### WSL2 NAT
+
+When running inside WSL2 in NAT mode, `0.0.0.0` binds inside the Linux VM. Other physical LAN devices may still need a Windows port-proxy and firewall rule forwarding the chosen Windows host port to the current WSL IPv4 address. Those host-level rules require an administrator and are intentionally not created by this project.
+
 ## Metrics
 
 - Cycle outcomes and focus come from cycle `context.json`, `result.json`, and `accepted.json` files.
