@@ -158,10 +158,10 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
     CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
   `)
   database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?)').run('session-1', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 500), Math.round(logTime))
-  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-1', 'session-1', JSON.stringify({ role: 'assistant', tokens: { total: 64000, reasoning: 1200 } }))
-  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-1', 'message-1', 'session-1', JSON.stringify({ type: 'reasoning', text: 'Structured model reasoning', time: { start: 10, end: 20 } }), Math.round(promptTime + 600))
-  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-2', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'edit', state: { status: 'completed', title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', metadata: { diff: '@@ -1 +1 @@\n-old\n+new' } } }), Math.round(promptTime + 700))
-  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-3', 'message-1', 'session-1', JSON.stringify({ type: 'text', text: 'Observed result', time: { start: 30, end: 40 } }), Math.round(promptTime + 800))
+  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-1', 'session-1', JSON.stringify({ role: 'assistant', tokens: { total: 64000, reasoning: 1200 }, time: { created: 10000, completed: 20000 } }))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-1', 'message-1', 'session-1', JSON.stringify({ type: 'reasoning', text: 'Structured model reasoning', time: { start: 11000, end: 15000 } }), Math.round(promptTime + 600))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-2', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'edit', state: { status: 'completed', title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', time: { start: 21000, end: 24000 }, metadata: { diff: '@@ -1 +1 @@\n-old\n+new' } } }), Math.round(promptTime + 700))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-3', 'message-1', 'session-1', JSON.stringify({ type: 'text', text: 'Observed result', time: { start: 15000, end: 17000 } }), Math.round(promptTime + 800))
   database.close()
 
   process.env.NODE_ENV = 'test'
@@ -176,16 +176,20 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
 
   try {
     const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
-      .then((response) => response.json()) as { cycles: Array<{ maxContextTokens: number; contextLimit: number; artifacts: Array<{ name: string; session: Record<string, unknown> | null }> }> }
+      .then((response) => response.json()) as { cycles: Array<{ maxContextTokens: number; contextLimit: number; timeBreakdown: Record<string, number>; artifacts: Array<{ name: string; session: Record<string, unknown> | null }> }> }
     assert.equal(dashboard.cycles[0].maxContextTokens, 64000)
     assert.equal(dashboard.cycles[0].contextLimit, 100000)
     assert.deepEqual(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.session, {
       model: 'MODEL', maxContextTokens: 64000, contextLimit: 100000, reasoningTokens: 1200, reasoningCount: 1,
+      inferenceMs: 10000, toolMs: 3000, reasoningMs: 4000, outputMs: 2000, otherInferenceMs: 4000,
+    })
+    assert.deepEqual(dashboard.cycles[0].timeBreakdown, {
+      inferenceMs: 10000, toolMs: 3000, reasoningMs: 4000, outputMs: 2000, otherInferenceMs: 4000,
     })
 
     const telemetry = await fetch(`http://127.0.0.1:${address.port}/api/artifact-telemetry?cycle=cycle-4-1000&file=worker-1.log`)
       .then((response) => response.json()) as { reasoning: unknown[]; events: Array<Record<string, unknown>> }
-    assert.deepEqual(telemetry.reasoning, [{ text: 'Structured model reasoning', startedAt: 10, endedAt: 20 }])
+    assert.deepEqual(telemetry.reasoning, [{ text: 'Structured model reasoning', startedAt: 11000, endedAt: 15000 }])
     assert.deepEqual(telemetry.events.map((event) => event.type), ['reasoning', 'tool', 'text'])
     assert.deepEqual(telemetry.events[1], {
       id: 'part-2', type: 'tool', createdAt: Math.round(promptTime + 700), tool: 'edit', status: 'completed',

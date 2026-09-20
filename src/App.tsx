@@ -19,6 +19,12 @@ const phaseColors: Record<PhaseName, string> = {
   reviewer: '#287271',
   retrospective: '#daa520',
 }
+const telemetryColors = {
+  reasoning: '#d65a31',
+  output: '#d19a32',
+  otherInference: '#e4bd52',
+  tools: '#287271',
+}
 const outcomeColors: Record<string, string> = {
   change: '#287271', investigation: '#d19a32', no_change: '#87908d',
   incomplete: '#c6483d', active: '#3277a8',
@@ -28,6 +34,10 @@ function duration(value: number | null): string {
   if (value === null) return '—'
   const minutes = Math.round(value / 60000)
   return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+function telemetryDuration(value: number): string {
+  if (value < 60000) return `${Math.round(value / 1000)}s`
+  return `${(value / 60000).toFixed(1)}m`
 }
 function percent(value: number): string { return `${Math.round(value * 100)}%` }
 function bytes(value: number): string {
@@ -306,6 +316,14 @@ function App() {
     const total = values.worker + values.reviewer + values.retrospective
     return { cycle: `#${cycle.cycle}`, ...Object.fromEntries((Object.keys(values) as PhaseName[]).map((phase) => [phase, total ? Math.round(values[phase] / total * 100) : 0])) }
   })
+  const telemetryData = measuredCycles.map((cycle) => ({
+    cycle: `#${cycle.cycle}`,
+    reasoning: cycle.timeBreakdown.reasoningMs / 60000,
+    output: cycle.timeBreakdown.outputMs / 60000,
+    otherInference: cycle.timeBreakdown.otherInferenceMs / 60000,
+    tools: cycle.timeBreakdown.toolMs / 60000,
+  }))
+  const hasTelemetry = telemetryData.some((point) => point.reasoning + point.output + point.otherInference + point.tools > 0)
   const outcomeData = Object.entries(data.metrics.outcomes).map(([name, value]) => ({ name: name.replace('_', ' '), key: name, value }))
   const filteredCycles = [...data.cycles].reverse().filter((cycle: Cycle) => `${cycle.cycle} ${cycle.focus} ${cycle.outcome} ${cycle.summary}`.toLowerCase().includes(deferredQuery.toLowerCase()))
   const selected = data.cycles.find((cycle) => cycle.id === selectedCycleId) || filteredCycles[0]
@@ -367,6 +385,27 @@ function App() {
           {(Object.keys(phaseColors) as PhaseName[]).map((phase) => <div className="phase-row" key={phase}><span className="swatch" style={{ background: phaseColors[phase] }} /><span>{phase}</span><strong>{percent(data.metrics.phaseShare[phase])}</strong><div className="phase-track"><span style={{ width: percent(data.metrics.phaseShare[phase]), background: phaseColors[phase] }} /></div></div>)}
           <p className="method-note">Time outside role logs is excluded. Values are directional, not billing-grade telemetry.</p>
         </article>
+
+        <article className="chart-panel wide">
+          <div className="panel-title"><div><h3>Inference & tool time per cycle</h3><p>Measured OpenCode intervals, minutes</p></div></div>
+          {hasTelemetry ? <ResponsiveContainer width="100%" height={260}><BarChart data={telemetryData} margin={{ top: 12, right: 18, left: -16, bottom: 0 }}>
+            <CartesianGrid stroke="#d8d9d2" vertical={false} strokeDasharray="2 4" /><XAxis dataKey="cycle" tickLine={false} axisLine={false} /><YAxis tickLine={false} axisLine={false} unit="m" />
+            <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)} min`, String(name).replace(/([A-Z])/g, ' $1').toLowerCase()]} /><Legend iconType="square" formatter={(value) => value.replace(/([A-Z])/g, ' $1').toLowerCase()} />
+            <Bar dataKey="reasoning" stackId="time" fill={telemetryColors.reasoning} />
+            <Bar dataKey="output" stackId="time" fill={telemetryColors.output} />
+            <Bar dataKey="otherInference" stackId="time" fill={telemetryColors.otherInference} />
+            <Bar dataKey="tools" stackId="time" fill={telemetryColors.tools} />
+          </BarChart></ResponsiveContainer> : <EmptyChart />}
+        </article>
+
+        <article className="chart-panel phase-summary">
+          <div className="panel-title"><div><h3>How time is classified</h3><p>Provider and tool lifecycle timestamps</p></div></div>
+          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.reasoning }} /><span>Reasoning</span><strong>inference</strong></div>
+          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.output }} /><span>Output</span><strong>inference</strong></div>
+          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.otherInference }} /><span>Other inference</span><strong>inference</strong></div>
+          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.tools }} /><span>Tool calls</span><strong>execution</strong></div>
+          <p className="method-note">Other inference is model time not covered by reasoning or text-part timestamps. It includes prefill, which OpenCode does not time separately.</p>
+        </article>
       </section>
 
       <div className="section-bar explorer-heading"><div><h2>Evidence explorer</h2><p>Inspect reports, prompts, logs, and loop event streams.</p></div></div>
@@ -378,7 +417,7 @@ function App() {
 
         <article className="cycle-detail">{selected ? <>
           <div className="detail-heading"><div><p className="eyebrow">CYCLE {selected.cycle} · {selected.focus.toUpperCase()}</p><h3>{selected.summary}</h3></div><span className={`outcome ${selected.outcome || selected.status}`}>{(selected.outcome || selected.status).replace('_', ' ')}</span></div>
-          <div className="cycle-facts"><div><span>Elapsed</span><strong>{duration(selected.durationMs)}</strong></div><div><span>Retries</span><strong>{selected.retryCount}</strong></div><div><span>Compactions</span><strong>{selected.compactionCount}</strong><small>W {selected.artifacts.filter((file) => file.name.startsWith('worker-')).reduce((sum, file) => sum + file.compactionCount, 0)} · R {selected.artifacts.filter((file) => file.name.startsWith('reviewer-')).reduce((sum, file) => sum + file.compactionCount, 0)} · Retro {selected.artifacts.filter((file) => file.name.startsWith('retrospective-')).reduce((sum, file) => sum + file.compactionCount, 0)}</small></div><div><span>Peak context</span><strong>{tokens(selected.maxContextTokens)} / {tokens(selected.contextLimit)}</strong><small>{typeof selected.maxContextTokens === 'number' && selected.contextLimit ? percent(selected.maxContextTokens / selected.contextLimit) : 'Session unavailable'}</small></div><div><span>Review</span><strong>{selected.decision || '—'}</strong></div><div><span>Commit</span><strong className="mono">{selected.commit?.slice(0, 8) || '—'}</strong></div></div>
+          <div className="cycle-facts"><div><span>Elapsed</span><strong>{duration(selected.durationMs)}</strong></div><div><span>Inference</span><strong>{telemetryDuration(selected.timeBreakdown.inferenceMs)}</strong><small>Reasoning {telemetryDuration(selected.timeBreakdown.reasoningMs)} · output {telemetryDuration(selected.timeBreakdown.outputMs)}</small></div><div><span>Tool calls</span><strong>{telemetryDuration(selected.timeBreakdown.toolMs)}</strong></div><div><span>Retries</span><strong>{selected.retryCount}</strong></div><div><span>Compactions</span><strong>{selected.compactionCount}</strong><small>W {selected.artifacts.filter((file) => file.name.startsWith('worker-')).reduce((sum, file) => sum + file.compactionCount, 0)} · R {selected.artifacts.filter((file) => file.name.startsWith('reviewer-')).reduce((sum, file) => sum + file.compactionCount, 0)} · Retro {selected.artifacts.filter((file) => file.name.startsWith('retrospective-')).reduce((sum, file) => sum + file.compactionCount, 0)}</small></div><div><span>Peak context</span><strong>{tokens(selected.maxContextTokens)} / {tokens(selected.contextLimit)}</strong><small>{typeof selected.maxContextTokens === 'number' && selected.contextLimit ? percent(selected.maxContextTokens / selected.contextLimit) : 'Session unavailable'}</small></div><div><span>Review</span><strong>{selected.decision || '—'}</strong></div><div><span>Commit</span><strong className="mono">{selected.commit?.slice(0, 8) || '—'}</strong></div></div>
           <div className="role-context" aria-label="Peak context by role">{(Object.keys(phaseColors) as PhaseName[]).map((role) => { const session = peakSession(selected.artifacts, role); const usage = session && contextPercent(session); return <div key={role}><span className="swatch" style={{ background: phaseColors[role] }} /><strong>{role}</strong><span>{session ? `${tokens(session.maxContextTokens)} / ${tokens(session.contextLimit)}` : 'No matched session'}</span><div className="context-track"><span style={{ width: usage || '0%', background: phaseColors[role] }} /></div><small>{usage || '—'}</small></div> })}</div>
           <div className="artifact-heading"><h4><FolderOpen size={17} />Artifacts</h4><span>{selected.artifacts.length} files</span></div>
           <div className="artifact-grid">{selected.artifacts.map((file) => <button key={file.name} onClick={() => void openArtifact(selected.id, file.name)}><FileText size={17} /><span><strong>{file.name}</strong><small>{bytes(file.size)} · {date(file.modifiedAt)}{file.name.endsWith('.log') ? ` · ${file.compactionCount} compact${file.session ? ` · ${tokens(file.session.maxContextTokens)}/${tokens(file.session.contextLimit)} ctx` : ' · no session'}` : ''}</small></span></button>)}</div>

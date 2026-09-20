@@ -6,6 +6,11 @@ export type SessionSummary = {
   contextLimit: number | null
   reasoningTokens: number
   reasoningCount: number
+  inferenceMs: number
+  toolMs: number
+  reasoningMs: number
+  outputMs: number
+  otherInferenceMs: number
 }
 
 export type SessionTelemetry = SessionSummary & {
@@ -49,6 +54,13 @@ export type Cycle = {
   compactionCount: number
   maxContextTokens: number | null
   contextLimit: number | null
+  timeBreakdown: {
+    inferenceMs: number
+    toolMs: number
+    reasoningMs: number
+    outputMs: number
+    otherInferenceMs: number
+  }
   phases: Record<PhaseName, { durationMs: number | null; attempts: number }>
   artifacts: Artifact[]
 }

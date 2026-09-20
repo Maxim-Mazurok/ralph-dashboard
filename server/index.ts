@@ -19,7 +19,8 @@ const openCodeDatabase = process.env.OPENCODE_DB_PATH || path.join(os.homedir(),
 const openCodeConfig = process.env.OPENCODE_CONFIG_PATH || path.join(os.homedir(), '.config/opencode/opencode.jsonc')
 
 type JsonObject = Record<string, unknown>
-type SessionSummary = { model: string; maxContextTokens: number; contextLimit: number | null; reasoningTokens: number; reasoningCount: number }
+type TimeBreakdown = { inferenceMs: number; toolMs: number; reasoningMs: number; outputMs: number; otherInferenceMs: number }
+type SessionSummary = TimeBreakdown & { model: string; maxContextTokens: number; contextLimit: number | null; reasoningTokens: number; reasoningCount: number }
 type ReasoningPart = { text: string; startedAt: number | null; endedAt: number | null }
 type SessionEvent = {
   id: string
@@ -54,6 +55,7 @@ type Cycle = {
   compactionCount: number
   maxContextTokens: number | null
   contextLimit: number | null
+  timeBreakdown: TimeBreakdown
   phases: Record<'worker' | 'reviewer' | 'retrospective', PhaseTiming>
   artifacts: Artifact[]
 }
@@ -113,7 +115,8 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
       const modelId = text(model.id)
       sessions.set(String(row.id), {
         id: String(row.id), createdAt: Number(row.time_created), updatedAt: Number(row.time_updated), model: modelId || 'unknown',
-        maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0, reasoning: [], events: [],
+        maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0,
+        inferenceMs: 0, toolMs: 0, reasoningMs: 0, outputMs: 0, otherInferenceMs: 0, reasoning: [], events: [],
       })
     }
     const messages = database.prepare('SELECT m.session_id, m.data FROM message m JOIN session s ON s.id = m.session_id WHERE s.directory = ?').all(projectRoot) as Array<Record<string, unknown>>
@@ -125,6 +128,10 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
       const tokens = message.tokens as JsonObject | undefined
       session.maxContextTokens = Math.max(session.maxContextTokens, Number(tokens?.total) || 0)
       session.reasoningTokens += Number(tokens?.reasoning) || 0
+      const time = message.time as JsonObject | undefined
+      const startedAt = Number(time?.created)
+      const endedAt = Number(time?.completed)
+      if (startedAt && endedAt >= startedAt) session.inferenceMs += endedAt - startedAt
     }
     const parts = database.prepare("SELECT p.id, p.session_id, p.time_created, p.data, m.data AS message_data FROM part p JOIN session s ON s.id = p.session_id JOIN message m ON m.id = p.message_id WHERE s.directory = ? ORDER BY p.time_created, p.id").all(projectRoot) as Array<Record<string, unknown>>
     for (const row of parts) {
@@ -137,6 +144,10 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
       if (partType === 'tool') {
         const state = part.state as JsonObject | undefined
         const metadata = state?.metadata as JsonObject | undefined
+        const time = state?.time as JsonObject | undefined
+        const startedAt = Number(time?.start)
+        const endedAt = Number(time?.end)
+        if (startedAt && endedAt >= startedAt) session.toolMs += endedAt - startedAt
         session.events.push({
           id: String(row.id), type: 'tool', createdAt: Number(row.time_created), tool: text(part.tool, 'tool'),
           status: text(state?.status, 'pending'), title: text(state?.title), input: state?.input,
@@ -148,10 +159,19 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
       const partText = text(part.text).trim()
       if (!partText) continue
       const time = part.time as JsonObject | undefined
+      const startedAt = Number(time?.start)
+      const endedAt = Number(time?.end)
+      if (startedAt && endedAt >= startedAt) {
+        if (partType === 'reasoning') session.reasoningMs += endedAt - startedAt
+        else session.outputMs += endedAt - startedAt
+      }
       session.events.push({ id: String(row.id), type: partType, createdAt: Number(row.time_created), text: partText })
       if (partType === 'reasoning') session.reasoning.push({ text: partText, startedAt: Number(time?.start) || null, endedAt: Number(time?.end) || null })
     }
-    for (const session of sessions.values()) session.reasoningCount = session.reasoning.length
+    for (const session of sessions.values()) {
+      session.reasoningCount = session.reasoning.length
+      session.otherInferenceMs = Math.max(0, session.inferenceMs - session.reasoningMs - session.outputMs)
+    }
     return [...sessions.values()]
   } catch (error) {
     console.warn(`Unable to read OpenCode telemetry: ${error instanceof Error ? error.message : error}`)
@@ -174,8 +194,8 @@ function matchingSession(log: Artifact, prompt: Artifact | undefined, sessions: 
 }
 
 function sessionSummary(session: OpenCodeSession): SessionSummary {
-  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount } = session
-  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount }
+  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, reasoningMs, outputMs, otherInferenceMs } = session
+  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, reasoningMs, outputMs, otherInferenceMs }
 }
 
 async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null> {
@@ -230,10 +250,12 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
     }
   }))
   artifacts.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+  const matchedSessions = new Map<string, OpenCodeSession>()
   for (const artifact of artifacts.filter((item) => item.name.endsWith('.log'))) {
     const prompt = artifacts.find((item) => item.name === artifact.name.replace(/\.log$/, '.md'))
     const session = matchingSession(artifact, prompt, sessions)
     artifact.session = session ? sessionSummary(session) : null
+    if (session) matchedSessions.set(session.id, session)
   }
 
   const context = await readJson(path.join(directory, 'context.json'))
@@ -269,6 +291,13 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
   const retryCount = Object.values(phaseTimings).reduce((total, phase) => total + Math.max(0, phase.attempts - 1), 0)
     + artifacts.filter((artifact) => artifact.name.includes('feedback')).length
   const peakSession = artifacts.reduce<SessionSummary | null>((peak, artifact) => artifact.session && (!peak || artifact.session.maxContextTokens > peak.maxContextTokens) ? artifact.session : peak, null)
+  const timeBreakdown = [...matchedSessions.values()].reduce<TimeBreakdown>((total, session) => ({
+    inferenceMs: total.inferenceMs + session.inferenceMs,
+    toolMs: total.toolMs + session.toolMs,
+    reasoningMs: total.reasoningMs + session.reasoningMs,
+    outputMs: total.outputMs + session.outputMs,
+    otherInferenceMs: total.otherInferenceMs + session.otherInferenceMs,
+  }), { inferenceMs: 0, toolMs: 0, reasoningMs: 0, outputMs: 0, otherInferenceMs: 0 })
 
   return {
     id: entryName,
@@ -286,6 +315,7 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
     compactionCount: artifacts.reduce((total, artifact) => total + artifact.compactionCount, 0),
     maxContextTokens: peakSession?.maxContextTokens ?? null,
     contextLimit: peakSession?.contextLimit ?? null,
+    timeBreakdown,
     phases: phaseTimings,
     artifacts,
   }
