@@ -6,6 +6,53 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
+test('deletes only the current unfinished cycle through the project reset command', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-reset-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-5-1000')
+  const script = path.join(root, 'scripts/continuous-improvement.cjs')
+  await mkdir(cycle, { recursive: true })
+  await mkdir(path.dirname(script), { recursive: true })
+  await writeFile(path.join(cycle, 'worker-1.log'), 'discarded work\n')
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({
+    completed: 4,
+    history: [],
+    active: { directory: cycle, base: 'test-base', focus: 'workflow', attempt: 1 },
+  }))
+  await writeFile(script, `
+const fs = require('node:fs')
+const path = require('node:path')
+if (process.argv[2] !== '--reset-cycle') process.exit(2)
+const statePath = path.join(process.cwd(), '.ralph/runtime/state.json')
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+fs.rmSync(state.active.directory, { recursive: true })
+delete state.active
+fs.writeFileSync(statePath, JSON.stringify(state))
+`)
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?reset=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/cycles/cycle-5-1000`, { method: 'DELETE' })
+    assert.equal(response.status, 200)
+    const dashboard = await response.json() as { cycles: unknown[]; active: unknown }
+    assert.deepEqual(dashboard.cycles, [])
+    assert.equal(dashboard.active, null)
+    await assert.rejects(stat(cycle), { code: 'ENOENT' })
+
+    const repeated = await fetch(`http://127.0.0.1:${address.port}/api/cycles/cycle-5-1000`, { method: 'DELETE' })
+    assert.equal(repeated.status, 409)
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('streams the newest active role log when state has no phase', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-7-1000')

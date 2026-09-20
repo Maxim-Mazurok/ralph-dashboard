@@ -1,9 +1,11 @@
 import express from 'express'
+import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { readdir, readFile, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { promisify } from 'node:util'
 
 const app = express()
 const port = Number(process.env.PORT || 4310)
@@ -18,6 +20,7 @@ const liveLogLimit = 256 * 1024
 const sessionStartToleranceMs = 10_000
 const openCodeDatabase = process.env.OPENCODE_DB_PATH || path.join(os.homedir(), '.local/share/opencode/opencode.db')
 const openCodeConfig = process.env.OPENCODE_CONFIG_PATH || path.join(os.homedir(), '.config/opencode/opencode.jsonc')
+const execFileAsync = promisify(execFile)
 
 type JsonObject = Record<string, unknown>
 type TimeBreakdown = { inferenceMs: number; toolMs: number; reasoningMs: number; outputMs: number; otherInferenceMs: number }
@@ -375,6 +378,7 @@ async function loadDashboard() {
 
   return {
     project: { name: path.basename(projectRoot), path: projectRoot, ralphPath: ralphRoot },
+    capabilities: { deleteActiveCycle: true },
     generatedAt: new Date().toISOString(),
     active: active ? {
       phase: text(active.phase, activeLog?.phase),
@@ -406,6 +410,39 @@ function safeFile(base: string, requested: string): string | null {
 
 app.get('/api/dashboard', async (_request, response, next) => {
   try { response.json(await loadDashboard()) } catch (error) { next(error) }
+})
+
+app.delete('/api/cycles/:cycle', async (request, response, next) => {
+  try {
+    const requestedCycle = request.params.cycle
+    if (!cyclePattern.test(requestedCycle)) return response.status(400).json({ error: 'Invalid cycle' })
+
+    const state = await readJson(path.join(runtimeRoot, 'state.json'))
+    const active = state?.active as JsonObject | undefined
+    const activeDirectory = path.resolve(text(active?.directory))
+    if (!active || path.dirname(activeDirectory) !== runtimeRoot || path.basename(activeDirectory) !== requestedCycle) {
+      return response.status(409).json({ error: 'Only the current unfinished cycle can be deleted' })
+    }
+
+    const entries = await readdir(runtimeRoot, { withFileTypes: true })
+    const latestCycle = entries
+      .filter((entry) => entry.isDirectory() && cyclePattern.test(entry.name))
+      .map((entry) => ({ name: entry.name, parts: cyclePattern.exec(entry.name)! }))
+      .sort((left, right) => Number(right.parts[1]) - Number(left.parts[1]) || Number(right.parts[2]) - Number(left.parts[2]))[0]
+    if (latestCycle?.name !== requestedCycle) {
+      return response.status(409).json({ error: 'Only the latest cycle can be deleted' })
+    }
+
+    const resetScript = path.join(projectRoot, 'scripts', 'continuous-improvement.cjs')
+    if (!existsSync(resetScript)) return response.status(501).json({ error: 'This project does not provide a cycle reset command' })
+    try {
+      await execFileAsync(process.execPath, [resetScript, '--reset-cycle'], { cwd: projectRoot })
+    } catch (error) {
+      const details = error as Error & { stderr?: string }
+      return response.status(409).json({ error: details.stderr?.trim() || details.message })
+    }
+    response.json(await loadDashboard())
+  } catch (error) { next(error) }
 })
 
 app.get('/api/artifact', async (request, response, next) => {

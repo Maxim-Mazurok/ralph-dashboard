@@ -5,7 +5,7 @@ import ReactDiffViewer, { DiffMethod } from 'react-diff-viewer-continued'
 import remarkGfm from 'remark-gfm'
 import {
   Activity, AlertTriangle, Archive, BarChart3, CheckCircle2, Clock3,
-  BrainCircuit, FileText, FolderOpen, Pause, Play, Radio, RefreshCw, Search, TimerReset, X,
+  BrainCircuit, FileText, FolderOpen, Pause, Play, Radio, RefreshCw, Search, TimerReset, Trash2, X,
 } from 'lucide-react'
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Line,
@@ -249,6 +249,7 @@ function App() {
   const [selectedCycleId, setSelectedCycleId] = useState('')
   const [artifact, setArtifact] = useState<{ title: string; content: string; terminal: boolean; markdown: boolean; session: SessionTelemetry | null } | null>(null)
   const [liveLogOpen, setLiveLogOpen] = useState(false)
+  const [deletingCycle, setDeletingCycle] = useState(false)
 
   async function load(showRefreshing = true) {
     if (showRefreshing) setRefreshing(true)
@@ -302,6 +303,26 @@ function App() {
     setArtifact({ title: name, content: response.ok ? await response.text() : `Unable to open stream (${response.status})`, terminal: false, markdown: false, session: null })
   }
 
+  async function deleteCycle(cycle: Cycle) {
+    if (!window.confirm(`Delete cycle ${cycle.cycle}? Its logs and uncommitted work will be erased, and the next loop will start this cycle again from scratch.`)) return
+    setDeletingCycle(true)
+    try {
+      const response = await fetch(`/api/cycles/${encodeURIComponent(cycle.id)}`, { method: 'DELETE' })
+      const result = await response.json() as DashboardData | { error?: string }
+      if (!response.ok) throw new Error('error' in result && result.error ? result.error : `API returned ${response.status}`)
+      const next = result as DashboardData
+      startTransition(() => {
+        setData(next)
+        setSelectedCycleId(next.cycles.at(-1)?.id || '')
+        setError('')
+      })
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Unable to delete cycle')
+    } finally {
+      setDeletingCycle(false)
+    }
+  }
+
   if (!data && !error) return <main className="loading"><Activity className="spin" /> Reading Ralph evidence…</main>
   if (!data) return <main className="loading error"><AlertTriangle /> {error}<button onClick={() => void load()}>Retry</button></main>
 
@@ -339,7 +360,7 @@ function App() {
 
     <main>
       <section className="page-heading">
-        <div><p className="eyebrow">READ-ONLY LOOP TELEMETRY</p><h1>Cycle performance</h1><p>Outcomes, workflow time, and the evidence behind every run.</p></div>
+        <div><p className="eyebrow">LOOP TELEMETRY</p><h1>Cycle performance</h1><p>Outcomes, workflow time, and the evidence behind every run.</p></div>
         <div className="path-label" title={data.project.path}>{data.project.path}</div>
       </section>
       {error && <div className="inline-error"><AlertTriangle size={16} />Refresh failed: {error}</div>}
@@ -416,7 +437,7 @@ function App() {
         </aside>
 
         <article className="cycle-detail">{selected ? <>
-          <div className="detail-heading"><div><p className="eyebrow">CYCLE {selected.cycle} · {selected.focus.toUpperCase()}</p><h3>{selected.summary}</h3></div><span className={`outcome ${selected.outcome || selected.status}`}>{(selected.outcome || selected.status).replace('_', ' ')}</span></div>
+          <div className="detail-heading"><div><p className="eyebrow">CYCLE {selected.cycle} · {selected.focus.toUpperCase()}</p><h3>{selected.summary}</h3></div><div className="detail-actions"><span className={`outcome ${selected.outcome || selected.status}`}>{(selected.outcome || selected.status).replace('_', ' ')}</span>{data.capabilities?.deleteActiveCycle && selected.id === data.cycles.at(-1)?.id && selected.status === 'active' && <button className="delete-cycle" title="Delete this unfinished cycle" disabled={deletingCycle} onClick={() => void deleteCycle(selected)}><Trash2 size={15} />{deletingCycle ? 'Deleting…' : 'Delete cycle'}</button>}</div></div>
           <div className="cycle-facts"><div><span>Elapsed</span><strong>{duration(selected.durationMs)}</strong></div><div><span>Inference</span><strong>{telemetryDuration(selected.timeBreakdown.inferenceMs)}</strong><small>Reasoning {telemetryDuration(selected.timeBreakdown.reasoningMs)} · output {telemetryDuration(selected.timeBreakdown.outputMs)}</small></div><div><span>Tool calls</span><strong>{telemetryDuration(selected.timeBreakdown.toolMs)}</strong></div><div><span>Retries</span><strong>{selected.retryCount}</strong></div><div><span>Compactions</span><strong>{selected.compactionCount}</strong><small>W {selected.artifacts.filter((file) => file.name.startsWith('worker-')).reduce((sum, file) => sum + file.compactionCount, 0)} · R {selected.artifacts.filter((file) => file.name.startsWith('reviewer-')).reduce((sum, file) => sum + file.compactionCount, 0)} · Retro {selected.artifacts.filter((file) => file.name.startsWith('retrospective-')).reduce((sum, file) => sum + file.compactionCount, 0)}</small></div><div><span>Peak context</span><strong>{tokens(selected.maxContextTokens)} / {tokens(selected.contextLimit)}</strong><small>{typeof selected.maxContextTokens === 'number' && selected.contextLimit ? percent(selected.maxContextTokens / selected.contextLimit) : 'Session unavailable'}</small></div><div><span>Review</span><strong>{selected.decision || '—'}</strong></div><div><span>Commit</span><strong className="mono">{selected.commit?.slice(0, 8) || '—'}</strong></div></div>
           <div className="role-context" aria-label="Peak context by role">{(Object.keys(phaseColors) as PhaseName[]).map((role) => { const session = peakSession(selected.artifacts, role); const usage = session && contextPercent(session); return <div key={role}><span className="swatch" style={{ background: phaseColors[role] }} /><strong>{role}</strong><span>{session ? `${tokens(session.maxContextTokens)} / ${tokens(session.contextLimit)}` : 'No matched session'}</span><div className="context-track"><span style={{ width: usage || '0%', background: phaseColors[role] }} /></div><small>{usage || '—'}</small></div> })}</div>
           <div className="artifact-heading"><h4><FolderOpen size={17} />Artifacts</h4><span>{selected.artifacts.length} files</span></div>
@@ -427,7 +448,7 @@ function App() {
       </section>
     </main>
 
-    <footer>Updated {date(data.generatedAt)} · Filesystem timings are approximate · Read-only access</footer>
+    <footer>Updated {date(data.generatedAt)} · Filesystem timings are approximate</footer>
     {liveLogOpen && <LiveLogDrawer onClose={() => setLiveLogOpen(false)} />}
     {artifact && <div className="drawer-backdrop" onMouseDown={() => setArtifact(null)}><aside className={artifact.terminal ? 'drawer terminal-drawer' : 'drawer'} onMouseDown={(event) => event.stopPropagation()}><header><div><FileText size={18} /><strong>{artifact.title}</strong>{artifact.session && <span className="drawer-context">{tokens(artifact.session.maxContextTokens)} / {tokens(artifact.session.contextLimit)} context</span>}</div><button className="icon-button" title="Close viewer" onClick={() => setArtifact(null)}><X size={18} /></button></header>{artifact.terminal ? <TerminalOutput content={artifact.content} session={artifact.session} /> : artifact.markdown ? <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.content}</ReactMarkdown></div> : <pre>{artifact.content}</pre>}</aside></div>}
   </div>

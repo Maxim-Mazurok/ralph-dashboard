@@ -67,6 +67,7 @@ export type Cycle = {
 
 export type DashboardData = {
   project: { name: string; path: string; ralphPath: string }
+  capabilities?: { deleteActiveCycle: boolean }
   generatedAt: string
   active: { phase: string; attempt: number; cycle: number; logFile: string | null } | null
   metrics: {
