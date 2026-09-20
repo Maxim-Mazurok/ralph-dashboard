@@ -1,10 +1,36 @@
 export type PhaseName = 'worker' | 'reviewer' | 'retrospective'
 
+export type SessionSummary = {
+  model: string
+  maxContextTokens: number
+  contextLimit: number | null
+  reasoningTokens: number
+  reasoningCount: number
+}
+
+export type SessionTelemetry = SessionSummary & {
+  reasoning: Array<{ text: string; startedAt: number | null; endedAt: number | null }>
+  events: Array<{
+    id: string
+    type: 'reasoning' | 'text' | 'tool'
+    createdAt: number
+    text?: string
+    tool?: string
+    status?: string
+    title?: string
+    input?: unknown
+    output?: string
+    diff?: string
+  }>
+}
+
 export type Artifact = {
   name: string
   size: number
   modifiedAt: string
   kind: string
+  compactionCount: number
+  session: SessionSummary | null
 }
 
 export type Cycle = {
@@ -20,6 +46,9 @@ export type Cycle = {
   commit: string | null
   durationMs: number | null
   retryCount: number
+  compactionCount: number
+  maxContextTokens: number | null
+  contextLimit: number | null
   phases: Record<PhaseName, { durationMs: number | null; attempts: number }>
   artifacts: Artifact[]
 }

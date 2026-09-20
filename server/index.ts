@@ -1,7 +1,9 @@
 import express from 'express'
 import { existsSync } from 'node:fs'
 import { readdir, readFile, stat } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 
 const app = express()
 const port = Number(process.env.PORT || 4310)
@@ -13,9 +15,26 @@ const cyclePattern = /^cycle-(\d+)-(\d+)$/
 const attemptPattern = /^(worker|reviewer|retrospective)-(\d+)\.(md|log)$/
 const textExtensions = new Set(['.json', '.jsonl', '.log', '.md', '.txt'])
 const liveLogLimit = 256 * 1024
+const openCodeDatabase = process.env.OPENCODE_DB_PATH || path.join(os.homedir(), '.local/share/opencode/opencode.db')
+const openCodeConfig = process.env.OPENCODE_CONFIG_PATH || path.join(os.homedir(), '.config/opencode/opencode.jsonc')
 
 type JsonObject = Record<string, unknown>
-type Artifact = { name: string; size: number; modifiedAt: string; kind: string }
+type SessionSummary = { model: string; maxContextTokens: number; contextLimit: number | null; reasoningTokens: number; reasoningCount: number }
+type ReasoningPart = { text: string; startedAt: number | null; endedAt: number | null }
+type SessionEvent = {
+  id: string
+  type: 'reasoning' | 'text' | 'tool'
+  createdAt: number
+  text?: string
+  tool?: string
+  status?: string
+  title?: string
+  input?: unknown
+  output?: string
+  diff?: string
+}
+type OpenCodeSession = SessionSummary & { id: string; createdAt: number; updatedAt: number; reasoning: ReasoningPart[]; events: SessionEvent[] }
+type Artifact = { name: string; size: number; modifiedAt: string; kind: string; compactionCount: number; session: SessionSummary | null }
 type PhaseTiming = { durationMs: number | null; attempts: number }
 type ActiveLog = { cycle: number; directory: string; file: string; phase: string; attempt: number }
 
@@ -32,6 +51,9 @@ type Cycle = {
   commit: string | null
   durationMs: number | null
   retryCount: number
+  compactionCount: number
+  maxContextTokens: number | null
+  contextLimit: number | null
   phases: Record<'worker' | 'reviewer' | 'retrospective', PhaseTiming>
   artifacts: Artifact[]
 }
@@ -52,6 +74,108 @@ function quantile(values: number[], percentile: number): number | null {
   if (!values.length) return null
   const sorted = [...values].sort((a, b) => a - b)
   return sorted[Math.min(sorted.length - 1, Math.floor(percentile * sorted.length))]
+}
+
+function countCompactions(content: string): number {
+  return content.match(/the conversation was compacted\b/gi)?.length || 0
+}
+
+function modelContextLimit(config: JsonObject | null, providerId: string, modelId: string): number | null {
+  const providers = config?.provider as JsonObject | undefined
+  const provider = providers?.[providerId] as JsonObject | undefined
+  const exactModel = (provider?.models as JsonObject | undefined)?.[modelId] as JsonObject | undefined
+  const exactLimit = Number((exactModel?.limit as JsonObject | undefined)?.context)
+  if (exactLimit) return exactLimit
+
+  const matchingLimits = new Set<number>()
+  for (const candidateProvider of Object.values(providers || {})) {
+    const models = (candidateProvider as JsonObject)?.models as JsonObject | undefined
+    for (const [candidateId, candidateModel] of Object.entries(models || {})) {
+      if (candidateId.toLowerCase() !== modelId.toLowerCase()) continue
+      const limit = Number((((candidateModel as JsonObject)?.limit as JsonObject | undefined)?.context))
+      if (limit) matchingLimits.add(limit)
+    }
+  }
+  return matchingLimits.size === 1 ? [...matchingLimits][0] : null
+}
+
+async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
+  if (!existsSync(openCodeDatabase)) return []
+  const config = await readJson(openCodeConfig)
+  let database: DatabaseSync | null = null
+  try {
+    database = new DatabaseSync(openCodeDatabase, { readOnly: true })
+    const sessionRows = database.prepare('SELECT id, model, time_created, time_updated FROM session WHERE directory = ?').all(projectRoot) as Array<Record<string, unknown>>
+    const sessions = new Map<string, OpenCodeSession>()
+    for (const row of sessionRows) {
+      const model = JSON.parse(text(row.model, '{}')) as JsonObject
+      const providerId = text(model.providerID)
+      const modelId = text(model.id)
+      sessions.set(String(row.id), {
+        id: String(row.id), createdAt: Number(row.time_created), updatedAt: Number(row.time_updated), model: modelId || 'unknown',
+        maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0, reasoning: [], events: [],
+      })
+    }
+    const messages = database.prepare('SELECT m.session_id, m.data FROM message m JOIN session s ON s.id = m.session_id WHERE s.directory = ?').all(projectRoot) as Array<Record<string, unknown>>
+    for (const row of messages) {
+      const session = sessions.get(String(row.session_id))
+      if (!session) continue
+      const message = JSON.parse(text(row.data, '{}')) as JsonObject
+      if (message.role !== 'assistant') continue
+      const tokens = message.tokens as JsonObject | undefined
+      session.maxContextTokens = Math.max(session.maxContextTokens, Number(tokens?.total) || 0)
+      session.reasoningTokens += Number(tokens?.reasoning) || 0
+    }
+    const parts = database.prepare("SELECT p.id, p.session_id, p.time_created, p.data, m.data AS message_data FROM part p JOIN session s ON s.id = p.session_id JOIN message m ON m.id = p.message_id WHERE s.directory = ? ORDER BY p.time_created, p.id").all(projectRoot) as Array<Record<string, unknown>>
+    for (const row of parts) {
+      const session = sessions.get(String(row.session_id))
+      if (!session) continue
+      const part = JSON.parse(text(row.data, '{}')) as JsonObject
+      const message = JSON.parse(text(row.message_data, '{}')) as JsonObject
+      if (message.role !== 'assistant') continue
+      const partType = text(part.type)
+      if (partType === 'tool') {
+        const state = part.state as JsonObject | undefined
+        const metadata = state?.metadata as JsonObject | undefined
+        session.events.push({
+          id: String(row.id), type: 'tool', createdAt: Number(row.time_created), tool: text(part.tool, 'tool'),
+          status: text(state?.status, 'pending'), title: text(state?.title), input: state?.input,
+          output: text(state?.output, text(state?.error)), diff: text(metadata?.diff),
+        })
+        continue
+      }
+      if (partType !== 'reasoning' && partType !== 'text') continue
+      const partText = text(part.text).trim()
+      if (!partText) continue
+      const time = part.time as JsonObject | undefined
+      session.events.push({ id: String(row.id), type: partType, createdAt: Number(row.time_created), text: partText })
+      if (partType === 'reasoning') session.reasoning.push({ text: partText, startedAt: Number(time?.start) || null, endedAt: Number(time?.end) || null })
+    }
+    for (const session of sessions.values()) session.reasoningCount = session.reasoning.length
+    return [...sessions.values()]
+  } catch (error) {
+    console.warn(`Unable to read OpenCode telemetry: ${error instanceof Error ? error.message : error}`)
+    return []
+  } finally {
+    database?.close()
+  }
+}
+
+function matchingSession(log: Artifact, prompt: Artifact | undefined, sessions: OpenCodeSession[]): OpenCodeSession | null {
+  if (!prompt) return null
+  const promptTime = Date.parse(prompt.modifiedAt)
+  const candidates = sessions
+    .map((session) => ({ session, distance: Math.abs(session.createdAt - promptTime) }))
+    .filter(({ distance }) => distance <= 5000)
+    .sort((left, right) => left.distance - right.distance)
+  if (candidates.length !== 1) return null
+  const match = candidates[0].session
+  return match.updatedAt <= Date.parse(log.modifiedAt) + 5000 || Date.now() - Date.parse(log.modifiedAt) < 10000 ? match : null
+}
+
+function sessionSummary(session: OpenCodeSession): SessionSummary {
+  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount } = session
+  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount }
 }
 
 async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null> {
@@ -86,7 +210,7 @@ async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null
   }
 }
 
-async function loadCycle(entryName: string, activeDirectory: string | null): Promise<Cycle | null> {
+async function loadCycle(entryName: string, activeDirectory: string | null, sessions: OpenCodeSession[]): Promise<Cycle | null> {
   const match = cyclePattern.exec(entryName)
   if (!match) return null
 
@@ -94,15 +218,23 @@ async function loadCycle(entryName: string, activeDirectory: string | null): Pro
   const entries = await readdir(directory, { withFileTypes: true })
   const files = entries.filter((entry) => entry.isFile())
   const artifacts = await Promise.all(files.map(async (entry): Promise<Artifact> => {
-    const details = await stat(path.join(directory, entry.name))
+    const filename = path.join(directory, entry.name)
+    const details = await stat(filename)
     return {
       name: entry.name,
       size: details.size,
       modifiedAt: details.mtime.toISOString(),
       kind: path.extname(entry.name).slice(1) || 'file',
+      compactionCount: entry.name.endsWith('.log') ? countCompactions(await readFile(filename, 'utf8')) : 0,
+      session: null,
     }
   }))
   artifacts.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+  for (const artifact of artifacts.filter((item) => item.name.endsWith('.log'))) {
+    const prompt = artifacts.find((item) => item.name === artifact.name.replace(/\.log$/, '.md'))
+    const session = matchingSession(artifact, prompt, sessions)
+    artifact.session = session ? sessionSummary(session) : null
+  }
 
   const context = await readJson(path.join(directory, 'context.json'))
   const result = await readJson(path.join(directory, 'result.json'))
@@ -136,6 +268,7 @@ async function loadCycle(entryName: string, activeDirectory: string | null): Pro
   const endedMs = isComplete && endCandidates.length ? Math.max(...endCandidates) : null
   const retryCount = Object.values(phaseTimings).reduce((total, phase) => total + Math.max(0, phase.attempts - 1), 0)
     + artifacts.filter((artifact) => artifact.name.includes('feedback')).length
+  const peakSession = artifacts.reduce<SessionSummary | null>((peak, artifact) => artifact.session && (!peak || artifact.session.maxContextTokens > peak.maxContextTokens) ? artifact.session : peak, null)
 
   return {
     id: entryName,
@@ -150,6 +283,9 @@ async function loadCycle(entryName: string, activeDirectory: string | null): Pro
     commit: text(accepted?.commit) || null,
     durationMs: endedMs ? Math.max(0, endedMs - startedMs) : null,
     retryCount,
+    compactionCount: artifacts.reduce((total, artifact) => total + artifact.compactionCount, 0),
+    maxContextTokens: peakSession?.maxContextTokens ?? null,
+    contextLimit: peakSession?.contextLimit ?? null,
     phases: phaseTimings,
     artifacts,
   }
@@ -162,7 +298,7 @@ async function listStreams(): Promise<Artifact[]> {
     .map((entry) => entry.name)
   return Promise.all(streamNames.map(async (name) => {
     const details = await stat(path.join(ralphRoot, name))
-    return { name, size: details.size, modifiedAt: details.mtime.toISOString(), kind: 'jsonl' }
+    return { name, size: details.size, modifiedAt: details.mtime.toISOString(), kind: 'jsonl', compactionCount: 0, session: null }
   }))
 }
 
@@ -181,6 +317,7 @@ function canonicalCycles(cycles: Cycle[]): Cycle[] {
 }
 
 async function loadDashboard() {
+  const sessions = await loadOpenCodeSessions()
   const state = await readJson(path.join(runtimeRoot, 'state.json'))
   const active = state?.active as JsonObject | undefined
   const activeLog = await findActiveLog(state)
@@ -188,7 +325,7 @@ async function loadDashboard() {
   const directoryEntries = await readdir(runtimeRoot, { withFileTypes: true })
   const cycleDirectories = (await Promise.all(directoryEntries
     .filter((entry) => entry.isDirectory() && cyclePattern.test(entry.name))
-    .map((entry) => loadCycle(entry.name, activeDirectory))))
+    .map((entry) => loadCycle(entry.name, activeDirectory, sessions))))
     .filter((cycle): cycle is Cycle => cycle !== null)
     .sort((a, b) => a.cycle - b.cycle || a.startedAt.localeCompare(b.startedAt))
   const cycles = canonicalCycles(cycleDirectories)
@@ -256,6 +393,22 @@ app.get('/api/artifact', async (request, response, next) => {
   } catch (error) { next(error) }
 })
 
+app.get('/api/artifact-telemetry', async (request, response, next) => {
+  try {
+    const cycle = String(request.query.cycle || '')
+    const file = String(request.query.file || '')
+    if (!cyclePattern.test(cycle) || !attemptPattern.test(file) || !file.endsWith('.log')) return response.status(400).json({ error: 'Invalid role log' })
+    const directory = path.join(runtimeRoot, cycle)
+    const logDetails = await stat(path.join(directory, file))
+    const promptName = file.replace(/\.log$/, '.md')
+    const promptDetails = await stat(path.join(directory, promptName))
+    const log: Artifact = { name: file, size: logDetails.size, modifiedAt: logDetails.mtime.toISOString(), kind: 'log', compactionCount: 0, session: null }
+    const prompt: Artifact = { name: promptName, size: promptDetails.size, modifiedAt: promptDetails.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }
+    const session = matchingSession(log, prompt, await loadOpenCodeSessions())
+    response.json(session ? { ...sessionSummary(session), reasoning: session.reasoning, events: session.events } : null)
+  } catch (error) { next(error) }
+})
+
 app.get('/api/stream', async (request, response, next) => {
   try {
     const file = path.basename(String(request.query.file || ''))
@@ -291,22 +444,32 @@ app.get('/api/live-log', async (request, response) => {
 
       const filename = path.join(activeLog.directory, activeLog.file)
       const details = await stat(filename)
-      const signature = `${filename}:${details.size}:${details.mtimeMs}`
-      if (signature === lastSignature) return
       const contents = await readFile(filename)
       const tail = contents.subarray(Math.max(0, contents.length - liveLogLimit)).toString('utf8')
-      response.write(`event: log\ndata: ${JSON.stringify({
+      const promptName = activeLog.file.replace(/\.log$/, '.md')
+      const logArtifact: Artifact = { name: activeLog.file, size: details.size, modifiedAt: details.mtime.toISOString(), kind: 'log', compactionCount: 0, session: null }
+      const promptFilename = path.join(activeLog.directory, promptName)
+      const promptDetails = existsSync(promptFilename) ? await stat(promptFilename) : null
+      const promptArtifact: Artifact | undefined = promptDetails
+        ? { name: promptName, size: promptDetails.size, modifiedAt: promptDetails.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }
+        : undefined
+      const session = matchingSession(logArtifact, promptArtifact, await loadOpenCodeSessions())
+      const payload = JSON.stringify({
         active: true,
         cycle: activeLog.cycle,
         phase: activeLog.phase,
         attempt: activeLog.attempt,
         file: activeLog.file,
         content: tail,
+        compactionCount: countCompactions(contents.toString('utf8')),
+        session: session ? { ...sessionSummary(session), reasoning: session.reasoning, events: session.events } : null,
         size: details.size,
         truncated: contents.length > liveLogLimit,
         updatedAt: details.mtime.toISOString(),
-      })}\n\n`)
-      lastSignature = signature
+      })
+      if (payload === lastSignature) return
+      response.write(`event: log\ndata: ${payload}\n\n`)
+      lastSignature = payload
     } catch (error) {
       response.write(`event: stream-error\ndata: ${JSON.stringify({ message: error instanceof Error ? error.message : 'Unable to read active log' })}\n\n`)
     } finally {
