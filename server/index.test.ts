@@ -66,7 +66,8 @@ test('streams OpenCode tool updates when the role log is unchanged', async () =>
     CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
     CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
   `)
-  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?)').run('session-live', root, '{}', Math.round(promptTime), Math.round(promptTime))
+  const sessionTime = Math.round(promptTime + 5500)
+  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?)').run('session-live', root, '{}', sessionTime, sessionTime)
   database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-live', 'session-live', JSON.stringify({ role: 'assistant' }))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-live', 'message-live', 'session-live', JSON.stringify({ type: 'tool', tool: 'edit', state: { status: 'pending', input: {} } }), Math.round(promptTime + 1))
 
@@ -89,7 +90,7 @@ test('streams OpenCode tool updates when the role log is unchanged', async () =>
     database.prepare('UPDATE part SET data = ? WHERE id = ?').run(JSON.stringify({
       type: 'tool', tool: 'edit', state: { status: 'completed', input: { oldString: 'old', newString: 'new' }, output: 'Done' },
     }), 'part-live')
-    database.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(Math.round(promptTime + 2), 'session-live')
+    database.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(sessionTime + 2, 'session-live')
 
     const nextFrame = await Promise.race([
       reader.read().then(({ value }) => decoder.decode(value)),

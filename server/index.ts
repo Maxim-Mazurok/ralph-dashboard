@@ -15,6 +15,7 @@ const cyclePattern = /^cycle-(\d+)-(\d+)$/
 const attemptPattern = /^(worker|reviewer|retrospective)-(\d+)\.(md|log)$/
 const textExtensions = new Set(['.json', '.jsonl', '.log', '.md', '.txt'])
 const liveLogLimit = 256 * 1024
+const sessionStartToleranceMs = 10_000
 const openCodeDatabase = process.env.OPENCODE_DB_PATH || path.join(os.homedir(), '.local/share/opencode/opencode.db')
 const openCodeConfig = process.env.OPENCODE_CONFIG_PATH || path.join(os.homedir(), '.config/opencode/opencode.jsonc')
 
@@ -186,7 +187,7 @@ function matchingSession(log: Artifact, prompt: Artifact | undefined, sessions: 
   const promptTime = Date.parse(prompt.modifiedAt)
   const candidates = sessions
     .map((session) => ({ session, distance: Math.abs(session.createdAt - promptTime) }))
-    .filter(({ distance }) => distance <= 5000)
+    .filter(({ distance }) => distance <= sessionStartToleranceMs)
     .sort((left, right) => left.distance - right.distance)
   if (candidates.length !== 1) return null
   const match = candidates[0].session
