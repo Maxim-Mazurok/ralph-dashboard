@@ -13,6 +13,14 @@ export type SessionSummary = {
   otherInferenceMs: number
 }
 
+export type SessionSubagent = {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  session: SessionTelemetry
+}
+
 export type SessionTelemetry = SessionSummary & {
   reasoning: Array<{ text: string; startedAt: number | null; endedAt: number | null }>
   events: Array<{
@@ -26,7 +34,9 @@ export type SessionTelemetry = SessionSummary & {
     input?: unknown
     output?: string
     diff?: string
+    subagent?: SessionSubagent
   }>
+  subagents: SessionSubagent[]
 }
 
 export type Artifact = {
@@ -67,7 +77,7 @@ export type Cycle = {
 
 export type DashboardData = {
   project: { name: string; path: string; ralphPath: string }
-  capabilities?: { deleteActiveCycle: boolean }
+  capabilities?: { deleteActiveCycle: boolean; discardActiveStep: boolean }
   generatedAt: string
   active: { phase: string; attempt: number; cycle: number; logFile: string | null } | null
   metrics: {

@@ -38,7 +38,13 @@ type SessionEvent = {
   output?: string
   diff?: string
 }
-type OpenCodeSession = SessionSummary & { id: string; createdAt: number; updatedAt: number; reasoning: ReasoningPart[]; events: SessionEvent[] }
+type OpenCodeSession = SessionSummary & { id: string; parentId: string | null; title: string; createdAt: number; updatedAt: number; reasoning: ReasoningPart[]; events: SessionEvent[] }
+type SubagentTelemetry = { id: string; title: string; createdAt: number; updatedAt: number; session: SessionTelemetry }
+type SessionTelemetry = SessionSummary & {
+  reasoning: ReasoningPart[]
+  events: Array<SessionEvent & { subagent?: SubagentTelemetry }>
+  subagents: SubagentTelemetry[]
+}
 type Artifact = { name: string; size: number; modifiedAt: string; kind: string; compactionCount: number; session: SessionSummary | null }
 type PhaseTiming = { durationMs: number | null; attempts: number }
 type ActiveLog = { cycle: number; directory: string; file: string; phase: string; attempt: number }
@@ -111,14 +117,15 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
   let database: DatabaseSync | null = null
   try {
     database = new DatabaseSync(openCodeDatabase, { readOnly: true })
-    const sessionRows = database.prepare('SELECT id, model, time_created, time_updated FROM session WHERE directory = ?').all(projectRoot) as Array<Record<string, unknown>>
+    const sessionRows = database.prepare('SELECT id, parent_id, title, model, time_created, time_updated FROM session WHERE directory = ?').all(projectRoot) as Array<Record<string, unknown>>
     const sessions = new Map<string, OpenCodeSession>()
     for (const row of sessionRows) {
       const model = JSON.parse(text(row.model, '{}')) as JsonObject
       const providerId = text(model.providerID)
       const modelId = text(model.id)
       sessions.set(String(row.id), {
-        id: String(row.id), createdAt: Number(row.time_created), updatedAt: Number(row.time_updated), model: modelId || 'unknown',
+        id: String(row.id), parentId: row.parent_id ? String(row.parent_id) : null, title: text(row.title, 'Subagent'),
+        createdAt: Number(row.time_created), updatedAt: Number(row.time_updated), model: modelId || 'unknown',
         maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0,
         inferenceMs: 0, toolMs: 0, reasoningMs: 0, outputMs: 0, otherInferenceMs: 0, reasoning: [], events: [],
       })
@@ -185,21 +192,52 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
   }
 }
 
-function matchingSession(log: Artifact, prompt: Artifact | undefined, sessions: OpenCodeSession[]): OpenCodeSession | null {
+function matchingSession(prompt: Artifact | undefined, sessions: OpenCodeSession[]): OpenCodeSession | null {
   if (!prompt) return null
   const promptTime = Date.parse(prompt.modifiedAt)
   const candidates = sessions
+    .filter((session) => session.parentId === null)
     .map((session) => ({ session, distance: Math.abs(session.createdAt - promptTime) }))
     .filter(({ distance }) => distance <= sessionStartToleranceMs)
     .sort((left, right) => left.distance - right.distance)
   if (candidates.length !== 1) return null
-  const match = candidates[0].session
-  return match.updatedAt <= Date.parse(log.modifiedAt) + 5000 || Date.now() - Date.parse(log.modifiedAt) < 10000 ? match : null
+  return candidates[0].session
 }
 
 function sessionSummary(session: OpenCodeSession): SessionSummary {
   const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, reasoningMs, outputMs, otherInferenceMs } = session
   return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, reasoningMs, outputMs, otherInferenceMs }
+}
+
+function sessionTelemetry(session: OpenCodeSession, sessions: OpenCodeSession[]): SessionTelemetry {
+  const children = sessions
+    .filter((candidate) => candidate.parentId === session.id)
+    .sort((left, right) => left.createdAt - right.createdAt)
+  const attached = new Set<string>()
+  const serialize = (child: OpenCodeSession): SubagentTelemetry => ({
+      id: child.id,
+      title: child.title,
+      createdAt: child.createdAt,
+      updatedAt: child.updatedAt,
+      session: sessionTelemetry(child, sessions),
+    })
+  const events = session.events.map((event) => {
+    if (event.type !== 'tool' || event.tool !== 'task') return event
+    const taskId = event.output?.match(/<task\s+id="([^"]+)"/)?.[1]
+    const child = children.find((candidate) => candidate.id === taskId)
+      || children.find((candidate) => !attached.has(candidate.id)
+        && candidate.createdAt >= event.createdAt
+        && candidate.title.toLowerCase().startsWith((event.title || '').toLowerCase()))
+    if (!child) return event
+    attached.add(child.id)
+    return { ...event, subagent: serialize(child) }
+  })
+  return {
+    ...sessionSummary(session),
+    reasoning: session.reasoning,
+    events,
+    subagents: children.filter((child) => !attached.has(child.id)).map(serialize),
+  }
 }
 
 async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null> {
@@ -257,7 +295,7 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
   const matchedSessions = new Map<string, OpenCodeSession>()
   for (const artifact of artifacts.filter((item) => item.name.endsWith('.log'))) {
     const prompt = artifacts.find((item) => item.name === artifact.name.replace(/\.log$/, '.md'))
-    const session = matchingSession(artifact, prompt, sessions)
+    const session = matchingSession(prompt, sessions)
     artifact.session = session ? sessionSummary(session) : null
     if (session) matchedSessions.set(session.id, session)
   }
@@ -378,7 +416,7 @@ async function loadDashboard() {
 
   return {
     project: { name: path.basename(projectRoot), path: projectRoot, ralphPath: ralphRoot },
-    capabilities: { deleteActiveCycle: true },
+    capabilities: { deleteActiveCycle: true, discardActiveStep: true },
     generatedAt: new Date().toISOString(),
     active: active ? {
       phase: text(active.phase, activeLog?.phase),
@@ -445,6 +483,30 @@ app.delete('/api/cycles/:cycle', async (request, response, next) => {
   } catch (error) { next(error) }
 })
 
+app.delete('/api/cycles/:cycle/step', async (request, response, next) => {
+  try {
+    const requestedCycle = request.params.cycle
+    if (!cyclePattern.test(requestedCycle)) return response.status(400).json({ error: 'Invalid cycle' })
+
+    const state = await readJson(path.join(runtimeRoot, 'state.json'))
+    const active = state?.active as JsonObject | undefined
+    const activeDirectory = path.resolve(text(active?.directory))
+    if (!active || path.dirname(activeDirectory) !== runtimeRoot || path.basename(activeDirectory) !== requestedCycle) {
+      return response.status(409).json({ error: 'Only the current incomplete workflow step can be discarded' })
+    }
+
+    const resetScript = path.join(projectRoot, 'scripts', 'continuous-improvement.cjs')
+    if (!existsSync(resetScript)) return response.status(501).json({ error: 'This project does not provide a step reset command' })
+    try {
+      await execFileAsync(process.execPath, [resetScript, '--reset-step'], { cwd: projectRoot })
+    } catch (error) {
+      const details = error as Error & { stderr?: string }
+      return response.status(409).json({ error: details.stderr?.trim() || details.message })
+    }
+    response.json(await loadDashboard())
+  } catch (error) { next(error) }
+})
+
 app.get('/api/artifact', async (request, response, next) => {
   try {
     const cycle = String(request.query.cycle || '')
@@ -467,13 +529,13 @@ app.get('/api/artifact-telemetry', async (request, response, next) => {
     const file = String(request.query.file || '')
     if (!cyclePattern.test(cycle) || !attemptPattern.test(file) || !file.endsWith('.log')) return response.status(400).json({ error: 'Invalid role log' })
     const directory = path.join(runtimeRoot, cycle)
-    const logDetails = await stat(path.join(directory, file))
+    await stat(path.join(directory, file))
     const promptName = file.replace(/\.log$/, '.md')
     const promptDetails = await stat(path.join(directory, promptName))
-    const log: Artifact = { name: file, size: logDetails.size, modifiedAt: logDetails.mtime.toISOString(), kind: 'log', compactionCount: 0, session: null }
     const prompt: Artifact = { name: promptName, size: promptDetails.size, modifiedAt: promptDetails.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }
-    const session = matchingSession(log, prompt, await loadOpenCodeSessions())
-    response.json(session ? { ...sessionSummary(session), reasoning: session.reasoning, events: session.events } : null)
+    const sessions = await loadOpenCodeSessions()
+    const session = matchingSession(prompt, sessions)
+    response.json(session ? sessionTelemetry(session, sessions) : null)
   } catch (error) { next(error) }
 })
 
@@ -515,13 +577,13 @@ app.get('/api/live-log', async (request, response) => {
       const contents = await readFile(filename)
       const tail = contents.subarray(Math.max(0, contents.length - liveLogLimit)).toString('utf8')
       const promptName = activeLog.file.replace(/\.log$/, '.md')
-      const logArtifact: Artifact = { name: activeLog.file, size: details.size, modifiedAt: details.mtime.toISOString(), kind: 'log', compactionCount: 0, session: null }
       const promptFilename = path.join(activeLog.directory, promptName)
       const promptDetails = existsSync(promptFilename) ? await stat(promptFilename) : null
       const promptArtifact: Artifact | undefined = promptDetails
         ? { name: promptName, size: promptDetails.size, modifiedAt: promptDetails.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }
         : undefined
-      const session = matchingSession(logArtifact, promptArtifact, await loadOpenCodeSessions())
+      const sessions = await loadOpenCodeSessions()
+      const session = matchingSession(promptArtifact, sessions)
       const payload = JSON.stringify({
         active: true,
         cycle: activeLog.cycle,
@@ -530,7 +592,7 @@ app.get('/api/live-log', async (request, response) => {
         file: activeLog.file,
         content: tail,
         compactionCount: countCompactions(contents.toString('utf8')),
-        session: session ? { ...sessionSummary(session), reasoning: session.reasoning, events: session.events } : null,
+        session: session ? sessionTelemetry(session, sessions) : null,
         size: details.size,
         truncated: contents.length > liveLogLimit,
         updatedAt: details.mtime.toISOString(),

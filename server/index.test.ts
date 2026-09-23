@@ -53,6 +53,51 @@ fs.writeFileSync(statePath, JSON.stringify(state))
   }
 })
 
+test('discards only the active step and keeps its cycle and phase checkpoint', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-step-reset-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-55-1000')
+  const script = path.join(root, 'scripts/continuous-improvement.cjs')
+  await mkdir(cycle, { recursive: true })
+  await mkdir(path.dirname(script), { recursive: true })
+  await writeFile(path.join(cycle, 'context.json'), JSON.stringify({ cycle: 55, focus: 'workflow' }))
+  await writeFile(path.join(cycle, 'result.json'), JSON.stringify({ outcome: 'change', summary: 'Worker complete' }))
+  await writeFile(path.join(cycle, 'reviewer-2.log'), 'incomplete review\n')
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({
+    completed: 54,
+    history: [],
+    active: { directory: cycle, base: 'test-base', focus: 'workflow', phase: 'reviewer', attempt: 2 },
+  }))
+  await writeFile(script, `
+const fs = require('node:fs')
+const path = require('node:path')
+if (process.argv[2] !== '--reset-step') process.exit(2)
+const state = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ralph/runtime/state.json'), 'utf8'))
+fs.rmSync(path.join(state.active.directory, 'reviewer-2.log'))
+`)
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?step-reset=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/cycles/cycle-55-1000/step`, { method: 'DELETE' })
+    assert.equal(response.status, 200)
+    const dashboard = await response.json() as { active: Record<string, unknown>; cycles: Array<{ id: string }> }
+    assert.equal(dashboard.active.phase, 'reviewer')
+    assert.equal(dashboard.active.attempt, 2)
+    assert.equal(dashboard.cycles.at(-1)?.id, 'cycle-55-1000')
+    await assert.rejects(stat(path.join(cycle, 'reviewer-2.log')), { code: 'ENOENT' })
+    await stat(path.join(cycle, 'result.json'))
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('streams the newest active role log when state has no phase', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-7-1000')
@@ -109,12 +154,12 @@ test('streams OpenCode tool updates when the role log is unchanged', async () =>
 
   const database = new DatabaseSync(databasePath)
   database.exec(`
-    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, model TEXT, time_created INTEGER, time_updated INTEGER);
+    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, model TEXT, time_created INTEGER, time_updated INTEGER, parent_id TEXT, title TEXT);
     CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
     CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
   `)
   const sessionTime = Math.round(promptTime + 5500)
-  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?)').run('session-live', root, '{}', sessionTime, sessionTime)
+  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-live', root, '{}', sessionTime, sessionTime, null, 'Worker')
   database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-live', 'session-live', JSON.stringify({ role: 'assistant' }))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-live', 'message-live', 'session-live', JSON.stringify({ type: 'tool', tool: 'edit', state: { status: 'pending', input: {} } }), Math.round(promptTime + 1))
 
@@ -201,15 +246,24 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
 
   const database = new DatabaseSync(databasePath)
   database.exec(`
-    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, model TEXT, time_created INTEGER, time_updated INTEGER);
+    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, model TEXT, time_created INTEGER, time_updated INTEGER, parent_id TEXT, title TEXT);
     CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
     CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
   `)
-  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?)').run('session-1', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 500), Math.round(logTime))
+  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-1', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 500), Math.round(logTime + 7_200_000), null, 'Worker')
+  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-child', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 900), Math.round(logTime + 7_200_000), 'session-1', 'Inspect API behavior (@explore subagent)')
+  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-grandchild', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 1100), Math.round(logTime + 7_200_000), 'session-child', 'Trace nested behavior (@explore subagent)')
   database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-1', 'session-1', JSON.stringify({ role: 'assistant', tokens: { total: 64000, reasoning: 1200 }, time: { created: 10000, completed: 20000 } }))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-1', 'message-1', 'session-1', JSON.stringify({ type: 'reasoning', text: 'Structured model reasoning', time: { start: 11000, end: 15000 } }), Math.round(promptTime + 600))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-2', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'edit', state: { status: 'completed', title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', time: { start: 21000, end: 24000 }, metadata: { diff: '@@ -1 +1 @@\n-old\n+new' } } }), Math.round(promptTime + 700))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-3', 'message-1', 'session-1', JSON.stringify({ type: 'text', text: 'Observed result', time: { start: 15000, end: 17000 } }), Math.round(promptTime + 800))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-task', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'task', state: { status: 'completed', title: 'Inspect API behavior', input: { prompt: 'Inspect the API' }, output: '<task id="session-child" state="completed"><task_result>Child session finding</task_result></task>' } }), Math.round(promptTime + 850))
+  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-child', 'session-child', JSON.stringify({ role: 'assistant' }))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-child', 'message-child', 'session-child', JSON.stringify({ type: 'text', text: 'Child session finding' }), Math.round(promptTime + 1000))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-child-task', 'message-child', 'session-child', JSON.stringify({ type: 'tool', tool: 'task', state: { status: 'completed', title: 'Trace nested behavior', input: { prompt: 'Trace nested behavior' }, output: '<task id="session-grandchild" state="completed"><task_result>Nested result</task_result></task>' } }), Math.round(promptTime + 1050))
+  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-grandchild', 'session-grandchild', JSON.stringify({ role: 'assistant' }))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-grandchild-reasoning', 'message-grandchild', 'session-grandchild', JSON.stringify({ type: 'reasoning', text: 'Nested reasoning' }), Math.round(promptTime + 1200))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-grandchild-tool', 'message-grandchild', 'session-grandchild', JSON.stringify({ type: 'tool', tool: 'read', state: { status: 'completed', title: 'Read nested file', input: { filePath: 'nested.ts' }, output: 'nested output' } }), Math.round(promptTime + 1300))
   database.close()
 
   process.env.NODE_ENV = 'test'
@@ -236,13 +290,20 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
     })
 
     const telemetry = await fetch(`http://127.0.0.1:${address.port}/api/artifact-telemetry?cycle=cycle-4-1000&file=worker-1.log`)
-      .then((response) => response.json()) as { reasoning: unknown[]; events: Array<Record<string, unknown>> }
+      .then((response) => response.json()) as { reasoning: unknown[]; events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown>> } } }> } } }>; subagents: unknown[] }
     assert.deepEqual(telemetry.reasoning, [{ text: 'Structured model reasoning', startedAt: 11000, endedAt: 15000 }])
-    assert.deepEqual(telemetry.events.map((event) => event.type), ['reasoning', 'tool', 'text'])
+    assert.deepEqual(telemetry.events.map((event) => event.type), ['reasoning', 'tool', 'text', 'tool'])
     assert.deepEqual(telemetry.events[1], {
       id: 'part-2', type: 'tool', createdAt: Math.round(promptTime + 700), tool: 'edit', status: 'completed',
       title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', diff: '@@ -1 +1 @@\n-old\n+new',
     })
+    assert.equal(telemetry.subagents.length, 0)
+    const child = telemetry.events[3].subagent
+    assert.equal(child?.title, 'Inspect API behavior (@explore subagent)')
+    assert.equal(child?.session.events[0].text, 'Child session finding')
+    const grandchild = child?.session.events[1].subagent
+    assert.equal(grandchild?.title, 'Trace nested behavior (@explore subagent)')
+    assert.deepEqual(grandchild?.session.events.map((event) => event.type), ['reasoning', 'tool'])
   } finally {
     server.close()
     await rm(root, { recursive: true, force: true })

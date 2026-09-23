@@ -5,13 +5,13 @@ import ReactDiffViewer, { DiffMethod } from 'react-diff-viewer-continued'
 import remarkGfm from 'remark-gfm'
 import {
   Activity, AlertTriangle, Archive, BarChart3, CheckCircle2, Clock3,
-  BrainCircuit, FileText, FolderOpen, Pause, Play, Radio, RefreshCw, Search, TimerReset, Trash2, X,
+  BrainCircuit, FileText, FolderOpen, Network, Pause, Play, Radio, RefreshCw, Search, TimerReset, Trash2, X,
 } from 'lucide-react'
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Line,
   LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
-import type { Artifact, Cycle, DashboardData, PhaseName, SessionSummary, SessionTelemetry } from './types'
+import type { Artifact, Cycle, DashboardData, PhaseName, SessionSubagent, SessionSummary, SessionTelemetry } from './types'
 import './App.css'
 
 const phaseColors: Record<PhaseName, string> = {
@@ -164,15 +164,24 @@ function hasToolInput(input: unknown): boolean {
   return input !== undefined && (typeof input !== 'object' || input === null || Object.keys(input).length > 0)
 }
 
+function SubagentOutput({ subagent, live }: { subagent: SessionSubagent; live: boolean }) {
+  return <details className="subagent-window" open={live}>
+    <summary><Network size={14} /><span><strong>Subagent</strong>{subagent.title}</span><time dateTime={new Date(subagent.createdAt).toISOString()}>{eventTime(subagent.createdAt)}</time></summary>
+    <TerminalOutput content="" session={subagent.session} live={live} />
+  </details>
+}
+
 function TerminalOutput({ content, session, outputRef, live = false }: { content: string; session: SessionTelemetry | null; outputRef?: React.RefObject<HTMLDivElement | null>; live?: boolean }) {
   const events = session?.events || []
+  const subagents = session?.subagents || []
   const hasPendingTool = events.some((event) => event.type === 'tool' && !['completed', 'error'].includes(event.status || 'pending'))
   return <div className="terminal-output" ref={outputRef}>
-    {events.length ? <div className="session-timeline">{events.map((event) => {
+    {events.length || subagents.length ? <div className="session-timeline">{events.map((event) => {
       if (event.type === 'reasoning') {
         return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="reasoning-block"><summary><BrainCircuit size={13} /><span className="summary-label">Thinking</span><span className="summary-preview">{firstLine(event.text)}</span></summary><pre>{event.text}</pre></details></div>
       }
       if (event.type === 'text') return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><pre className="assistant-output">{event.text}</pre></div>
+      if (event.subagent) return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><SubagentOutput subagent={event.subagent} live={live} /></div>
       const editDiff = event.tool === 'edit' ? event.diff || fallbackEditDiff(event.input) : null
       return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className={`tool-event ${event.status || 'pending'}`}>
         <summary><span className="tool-name">{event.tool || 'tool'}</span><span className="summary-preview">{event.title || event.status || 'pending'}</span></summary>
@@ -181,7 +190,9 @@ function TerminalOutput({ content, session, outputRef, live = false }: { content
           {event.output && <><strong>{event.status === 'error' ? 'Error' : 'Output'}</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(event.output) }} /></>}
         </div>
       </details></div>
-    })}{live && hasPendingTool && <div className="live-pending-output"><strong>Streaming</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(liveTail(content)) }} /></div>}</div> : <pre dangerouslySetInnerHTML={{ __html: terminalHtml(content) }} />}
+    })}{live && hasPendingTool && <div className="live-pending-output"><strong>Streaming</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(liveTail(content)) }} /></div>}
+      {subagents.map((subagent) => <SubagentOutput subagent={subagent} live={live} key={subagent.id} />)}
+    </div> : <pre dangerouslySetInnerHTML={{ __html: terminalHtml(content) }} />}
   </div>
 }
 
@@ -250,6 +261,7 @@ function App() {
   const [artifact, setArtifact] = useState<{ title: string; content: string; terminal: boolean; markdown: boolean; session: SessionTelemetry | null } | null>(null)
   const [liveLogOpen, setLiveLogOpen] = useState(false)
   const [deletingCycle, setDeletingCycle] = useState(false)
+  const [discardingStep, setDiscardingStep] = useState(false)
 
   async function load(showRefreshing = true) {
     if (showRefreshing) setRefreshing(true)
@@ -320,6 +332,25 @@ function App() {
       setError(caught instanceof Error ? caught.message : 'Unable to delete cycle')
     } finally {
       setDeletingCycle(false)
+    }
+  }
+
+  async function discardStep(cycle: Cycle) {
+    const phase = data?.active?.phase || 'current'
+    if (!window.confirm(`Discard the incomplete ${phase} step from cycle ${cycle.cycle}? The cycle and completed earlier steps will be preserved, and the next loop will resume at ${phase}.`)) return
+    setDiscardingStep(true)
+    try {
+      const response = await fetch(`/api/cycles/${encodeURIComponent(cycle.id)}/step`, { method: 'DELETE' })
+      const result = await response.json() as DashboardData | { error?: string }
+      if (!response.ok) throw new Error('error' in result && result.error ? result.error : `API returned ${response.status}`)
+      startTransition(() => {
+        setData(result as DashboardData)
+        setError('')
+      })
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Unable to discard workflow step')
+    } finally {
+      setDiscardingStep(false)
     }
   }
 
@@ -437,7 +468,7 @@ function App() {
         </aside>
 
         <article className="cycle-detail">{selected ? <>
-          <div className="detail-heading"><div><p className="eyebrow">CYCLE {selected.cycle} · {selected.focus.toUpperCase()}</p><h3>{selected.summary}</h3></div><div className="detail-actions"><span className={`outcome ${selected.outcome || selected.status}`}>{(selected.outcome || selected.status).replace('_', ' ')}</span>{data.capabilities?.deleteActiveCycle && selected.id === data.cycles.at(-1)?.id && selected.status === 'active' && <button className="delete-cycle" title="Delete this unfinished cycle" disabled={deletingCycle} onClick={() => void deleteCycle(selected)}><Trash2 size={15} />{deletingCycle ? 'Deleting…' : 'Delete cycle'}</button>}</div></div>
+          <div className="detail-heading"><div><p className="eyebrow">CYCLE {selected.cycle} · {selected.focus.toUpperCase()}</p><h3>{selected.summary}</h3></div><div className="detail-actions"><span className={`outcome ${selected.outcome || selected.status}`}>{(selected.outcome || selected.status).replace('_', ' ')}</span>{data.capabilities?.discardActiveStep && selected.id === data.cycles.at(-1)?.id && selected.status === 'active' && <button className="discard-step" title="Discard this incomplete workflow step" disabled={discardingStep || deletingCycle} onClick={() => void discardStep(selected)}><TimerReset size={15} />{discardingStep ? 'Discarding…' : `Discard ${data.active?.phase || 'step'}`}</button>}{data.capabilities?.deleteActiveCycle && selected.id === data.cycles.at(-1)?.id && selected.status === 'active' && <button className="delete-cycle" title="Delete this unfinished cycle" disabled={deletingCycle || discardingStep} onClick={() => void deleteCycle(selected)}><Trash2 size={15} />{deletingCycle ? 'Deleting…' : 'Delete cycle'}</button>}</div></div>
           <div className="cycle-facts"><div><span>Elapsed</span><strong>{duration(selected.durationMs)}</strong></div><div><span>Inference</span><strong>{telemetryDuration(selected.timeBreakdown.inferenceMs)}</strong><small>Reasoning {telemetryDuration(selected.timeBreakdown.reasoningMs)} · output {telemetryDuration(selected.timeBreakdown.outputMs)}</small></div><div><span>Tool calls</span><strong>{telemetryDuration(selected.timeBreakdown.toolMs)}</strong></div><div><span>Retries</span><strong>{selected.retryCount}</strong></div><div><span>Compactions</span><strong>{selected.compactionCount}</strong><small>W {selected.artifacts.filter((file) => file.name.startsWith('worker-')).reduce((sum, file) => sum + file.compactionCount, 0)} · R {selected.artifacts.filter((file) => file.name.startsWith('reviewer-')).reduce((sum, file) => sum + file.compactionCount, 0)} · Retro {selected.artifacts.filter((file) => file.name.startsWith('retrospective-')).reduce((sum, file) => sum + file.compactionCount, 0)}</small></div><div><span>Peak context</span><strong>{tokens(selected.maxContextTokens)} / {tokens(selected.contextLimit)}</strong><small>{typeof selected.maxContextTokens === 'number' && selected.contextLimit ? percent(selected.maxContextTokens / selected.contextLimit) : 'Session unavailable'}</small></div><div><span>Review</span><strong>{selected.decision || '—'}</strong></div><div><span>Commit</span><strong className="mono">{selected.commit?.slice(0, 8) || '—'}</strong></div></div>
           <div className="role-context" aria-label="Peak context by role">{(Object.keys(phaseColors) as PhaseName[]).map((role) => { const session = peakSession(selected.artifacts, role); const usage = session && contextPercent(session); return <div key={role}><span className="swatch" style={{ background: phaseColors[role] }} /><strong>{role}</strong><span>{session ? `${tokens(session.maxContextTokens)} / ${tokens(session.contextLimit)}` : 'No matched session'}</span><div className="context-track"><span style={{ width: usage || '0%', background: phaseColors[role] }} /></div><small>{usage || '—'}</small></div> })}</div>
           <div className="artifact-heading"><h4><FolderOpen size={17} />Artifacts</h4><span>{selected.artifacts.length} files</span></div>
