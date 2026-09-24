@@ -63,10 +63,11 @@ When running inside WSL2 in NAT mode, `0.0.0.0` binds inside the Linux VM. Other
 ## Metrics
 
 - Cycle outcomes and focus come from cycle `context.json`, `result.json`, and `accepted.json` files.
+- Completed cycles have an `accepted.json` or `retrospective.json` file. For cycles from before those files existed, a matching completion record in a later cycle's `context.json` or current `state.json` history is accepted when `result.json` and an accepting `review.json` are present.
 - Cycle elapsed time runs from the millisecond timestamp in the cycle directory name to the latest completion artifact.
 - Worker, reviewer, and retrospective time is inferred from each attempt prompt's modification time through its log's modification time.
 - "Needed retry" counts extra role attempts and feedback artifacts.
-- Change outcome rate is the share of completed current-harness cycles whose accepted outcome is `change`, rather than `investigation` or `no_change`.
+- Change outcome rate is the share of completed cycles whose outcome is `change`, rather than `investigation` or `no_change`.
 
 Filesystem-derived timings are marked approximate in the UI. They are useful for trends and workflow comparisons, but are not billing-grade telemetry.
 

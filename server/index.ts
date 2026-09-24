@@ -23,7 +23,7 @@ const openCodeConfig = process.env.OPENCODE_CONFIG_PATH || path.join(os.homedir(
 const execFileAsync = promisify(execFile)
 
 type JsonObject = Record<string, unknown>
-type TimeBreakdown = { inferenceMs: number; toolMs: number; reasoningMs: number; outputMs: number; otherInferenceMs: number }
+type TimeBreakdown = { inferenceMs: number; toolMs: number; delegatedMs: number; firstContentMs: number; reasoningMs: number; outputMs: number; toolOutputMs: number; otherInferenceMs: number }
 type SessionSummary = TimeBreakdown & { model: string; maxContextTokens: number; contextLimit: number | null; reasoningTokens: number; reasoningCount: number }
 type ReasoningPart = { text: string; startedAt: number | null; endedAt: number | null }
 type SessionEvent = {
@@ -39,6 +39,29 @@ type SessionEvent = {
   diff?: string
 }
 type OpenCodeSession = SessionSummary & { id: string; parentId: string | null; title: string; createdAt: number; updatedAt: number; reasoning: ReasoningPart[]; events: SessionEvent[] }
+type Interval = { start: number; end: number }
+
+function mergedIntervals(intervals: Interval[]): Interval[] {
+  const merged: Interval[] = []
+  for (const interval of intervals.filter(({ start, end }) => start > 0 && end >= start).sort((a, b) => a.start - b.start)) {
+    const last = merged.at(-1)
+    if (last && interval.start <= last.end) last.end = Math.max(last.end, interval.end)
+    else merged.push({ ...interval })
+  }
+  return merged
+}
+
+function intervalDuration(intervals: Interval[]): number {
+  return intervals.reduce((total, { start, end }) => total + end - start, 0)
+}
+
+function overlap(interval: Interval, intervals: Interval[]): number {
+  return intervals.reduce((total, item) => total + Math.max(0, Math.min(interval.end, item.end) - Math.max(interval.start, item.start)), 0)
+}
+
+function measuredDuration(intervals: Interval[], excluded: Interval[]): number {
+  return intervals.reduce((total, interval) => total + interval.end - interval.start - overlap(interval, excluded), 0)
+}
 type SubagentTelemetry = { id: string; title: string; createdAt: number; updatedAt: number; session: SessionTelemetry }
 type SessionTelemetry = SessionSummary & {
   reasoning: ReasoningPart[]
@@ -111,7 +134,7 @@ function modelContextLimit(config: JsonObject | null, providerId: string, modelI
   return matchingLimits.size === 1 ? [...matchingLimits][0] : null
 }
 
-async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
+async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSession[]> {
   if (!existsSync(openCodeDatabase)) return []
   const config = await readJson(openCodeConfig)
   let database: DatabaseSync | null = null
@@ -127,23 +150,87 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
         id: String(row.id), parentId: row.parent_id ? String(row.parent_id) : null, title: text(row.title, 'Subagent'),
         createdAt: Number(row.time_created), updatedAt: Number(row.time_updated), model: modelId || 'unknown',
         maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0,
-        inferenceMs: 0, toolMs: 0, reasoningMs: 0, outputMs: 0, otherInferenceMs: 0, reasoning: [], events: [],
+        inferenceMs: 0, toolMs: 0, delegatedMs: 0, firstContentMs: 0, reasoningMs: 0, outputMs: 0, toolOutputMs: 0, otherInferenceMs: 0, reasoning: [], events: [],
       })
     }
-    const messages = database.prepare('SELECT m.session_id, m.data FROM message m JOIN session s ON s.id = m.session_id WHERE s.directory = ?').all(projectRoot) as Array<Record<string, unknown>>
+    // Read only timing fields for the dashboard. Message completion includes tool execution,
+    // so subtract tool intervals before classifying model time.
+    const messages = database.prepare(`
+      SELECT m.id, m.session_id,
+        json_extract(m.data, '$.tokens.total') AS total_tokens,
+        json_extract(m.data, '$.tokens.reasoning') AS reasoning_tokens,
+        json_extract(m.data, '$.time.created') AS started_at,
+        json_extract(m.data, '$.time.completed') AS ended_at
+      FROM message m JOIN session s ON s.id = m.session_id
+      WHERE s.directory = ? AND json_extract(m.data, '$.role') = 'assistant'
+    `).all(projectRoot) as Array<Record<string, unknown>>
+    const partsByMessage = new Map<string, { reasoning: Interval[]; output: Interval[]; tools: Interval[]; tasks: Interval[] }>()
+    const sessionByMessage = new Map(messages.map((message) => [String(message.id), String(message.session_id)]))
+    const timingParts = database.prepare(`
+      SELECT p.message_id,
+        json_extract(p.data, '$.type') AS type,
+        json_extract(p.data, '$.tool') AS tool,
+        length(trim(COALESCE(json_extract(p.data, '$.text'), ''))) AS content_length,
+        json_extract(p.data, '$.time.start') AS started_at,
+        json_extract(p.data, '$.time.end') AS ended_at,
+        json_extract(p.data, '$.state.time.start') AS tool_started_at,
+        json_extract(p.data, '$.state.time.end') AS tool_ended_at
+      FROM part p JOIN session s ON s.id = p.session_id JOIN message m ON m.id = p.message_id
+      WHERE s.directory = ? AND json_extract(m.data, '$.role') = 'assistant'
+        AND json_extract(p.data, '$.type') IN ('reasoning', 'text', 'tool')
+    `).all(projectRoot) as Array<Record<string, unknown>>
+    for (const row of timingParts) {
+      const id = String(row.message_id)
+      let group = partsByMessage.get(id)
+      if (!group) {
+        group = { reasoning: [], output: [], tools: [], tasks: [] }
+        partsByMessage.set(id, group)
+      }
+      const type = String(row.type)
+      const start = Number(type === 'tool' ? row.tool_started_at : row.started_at)
+      const end = Number(type === 'tool' ? row.tool_ended_at : row.ended_at)
+      if (type === 'reasoning' && Number(row.content_length) > 0) {
+        const session = sessions.get(sessionByMessage.get(id) || '')
+        if (session) session.reasoningCount++
+      }
+      if (!start || !Number.isFinite(end) || end < start) continue
+      if (type === 'reasoning' && Number(row.content_length) > 0) group.reasoning.push({ start, end })
+      if (type === 'text' && Number(row.content_length) > 0) group.output.push({ start, end })
+      if (type === 'tool') group[row.tool === 'task' ? 'tasks' : 'tools'].push({ start, end })
+    }
     for (const row of messages) {
       const session = sessions.get(String(row.session_id))
       if (!session) continue
-      const message = JSON.parse(text(row.data, '{}')) as JsonObject
-      if (message.role !== 'assistant') continue
-      const tokens = message.tokens as JsonObject | undefined
-      session.maxContextTokens = Math.max(session.maxContextTokens, Number(tokens?.total) || 0)
-      session.reasoningTokens += Number(tokens?.reasoning) || 0
-      const time = message.time as JsonObject | undefined
-      const startedAt = Number(time?.created)
-      const endedAt = Number(time?.completed)
-      if (startedAt && endedAt >= startedAt) session.inferenceMs += endedAt - startedAt
+      session.maxContextTokens = Math.max(session.maxContextTokens, Number(row.total_tokens) || 0)
+      session.reasoningTokens += Number(row.reasoning_tokens) || 0
+      const group = partsByMessage.get(String(row.id)) || { reasoning: [], output: [], tools: [], tasks: [] }
+      const tools = mergedIntervals(group.tools)
+      const tasks = mergedIntervals(group.tasks)
+      session.toolMs += intervalDuration(tools)
+      session.delegatedMs += measuredDuration(tasks, tools)
+      const start = Number(row.started_at)
+      const end = Number(row.ended_at)
+      if (!start || !Number.isFinite(end) || end < start) continue
+      const excluded = mergedIntervals([...tools, ...tasks].map((item) => ({ start: Math.max(start, item.start), end: Math.min(end, item.end) })).filter((item) => item.end >= item.start))
+      const inference = end - start - intervalDuration(excluded)
+      session.inferenceMs += inference
+      const timed = [...group.reasoning, ...group.output].filter((item) => item.start >= start && item.end <= end)
+      const firstStart = timed.length ? Math.min(...timed.map((item) => item.start)) : null
+      const lastEnd = timed.length ? Math.max(...timed.map((item) => item.end)) : null
+      const firstContent = firstStart === null ? 0 : measuredDuration([{ start, end: firstStart }], excluded)
+      const reasoningIntervals = mergedIntervals(group.reasoning.filter((item) => item.start >= start && item.end <= end))
+      const reasoning = measuredDuration(reasoningIntervals, excluded)
+      const output = measuredDuration(mergedIntervals(group.output.filter((item) => item.start >= start && item.end <= end)), mergedIntervals([...excluded, ...reasoningIntervals]))
+      const firstTool = [...tools, ...tasks].filter((item) => item.start >= start && item.start <= end).sort((a, b) => a.start - b.start)[0]?.start ?? null
+      const toolOutput = lastEnd !== null && firstTool !== null && firstTool > lastEnd
+        ? measuredDuration([{ start: lastEnd, end: Math.min(end, firstTool) }], excluded) : 0
+      session.firstContentMs += firstContent
+      session.reasoningMs += reasoning
+      session.outputMs += output
+      session.toolOutputMs += toolOutput
+      session.otherInferenceMs += Math.max(0, inference - firstContent - reasoning - output - toolOutput)
     }
+    if (summaryOnly) return [...sessions.values()]
     const parts = database.prepare("SELECT p.id, p.session_id, p.time_created, p.data, m.data AS message_data FROM part p JOIN session s ON s.id = p.session_id JOIN message m ON m.id = p.message_id WHERE s.directory = ? ORDER BY p.time_created, p.id").all(projectRoot) as Array<Record<string, unknown>>
     for (const row of parts) {
       const session = sessions.get(String(row.session_id))
@@ -155,10 +242,6 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
       if (partType === 'tool') {
         const state = part.state as JsonObject | undefined
         const metadata = state?.metadata as JsonObject | undefined
-        const time = state?.time as JsonObject | undefined
-        const startedAt = Number(time?.start)
-        const endedAt = Number(time?.end)
-        if (startedAt && endedAt >= startedAt) session.toolMs += endedAt - startedAt
         session.events.push({
           id: String(row.id), type: 'tool', createdAt: Number(row.time_created), tool: text(part.tool, 'tool'),
           status: text(state?.status, 'pending'), title: text(state?.title), input: state?.input,
@@ -170,18 +253,8 @@ async function loadOpenCodeSessions(): Promise<OpenCodeSession[]> {
       const partText = text(part.text).trim()
       if (!partText) continue
       const time = part.time as JsonObject | undefined
-      const startedAt = Number(time?.start)
-      const endedAt = Number(time?.end)
-      if (startedAt && endedAt >= startedAt) {
-        if (partType === 'reasoning') session.reasoningMs += endedAt - startedAt
-        else session.outputMs += endedAt - startedAt
-      }
       session.events.push({ id: String(row.id), type: partType, createdAt: Number(row.time_created), text: partText })
       if (partType === 'reasoning') session.reasoning.push({ text: partText, startedAt: Number(time?.start) || null, endedAt: Number(time?.end) || null })
-    }
-    for (const session of sessions.values()) {
-      session.reasoningCount = session.reasoning.length
-      session.otherInferenceMs = Math.max(0, session.inferenceMs - session.reasoningMs - session.outputMs)
     }
     return [...sessions.values()]
   } catch (error) {
@@ -205,8 +278,8 @@ function matchingSession(prompt: Artifact | undefined, sessions: OpenCodeSession
 }
 
 function sessionSummary(session: OpenCodeSession): SessionSummary {
-  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, reasoningMs, outputMs, otherInferenceMs } = session
-  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, reasoningMs, outputMs, otherInferenceMs }
+  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs } = session
+  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs }
 }
 
 function sessionTelemetry(session: OpenCodeSession, sessions: OpenCodeSession[]): SessionTelemetry {
@@ -272,7 +345,7 @@ async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null
   }
 }
 
-async function loadCycle(entryName: string, activeDirectory: string | null, sessions: OpenCodeSession[]): Promise<Cycle | null> {
+async function loadCycle(entryName: string, activeDirectory: string | null, sessions: OpenCodeSession[], completedRecord: JsonObject | undefined): Promise<Cycle | null> {
   const match = cyclePattern.exec(entryName)
   if (!match) return null
 
@@ -308,7 +381,10 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
   const cycleNumber = Number(match[1])
   const startedMs = Number(match[2])
   const isActive = activeDirectory === directory
-  const isComplete = Boolean(accepted || retrospective)
+  // Before accepted.json existed, the coordinator recorded finished cycles in
+  // state.history and copied those records into the next cycle's context.
+  const legacyComplete = Boolean(!accepted && !retrospective && result && review?.decision === 'accept' && completedRecord)
+  const isComplete = Boolean(accepted || retrospective || legacyComplete)
 
   const phaseTimings = {} as Cycle['phases']
   for (const role of ['worker', 'reviewer', 'retrospective'] as const) {
@@ -336,10 +412,13 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
   const timeBreakdown = [...matchedSessions.values()].reduce<TimeBreakdown>((total, session) => ({
     inferenceMs: total.inferenceMs + session.inferenceMs,
     toolMs: total.toolMs + session.toolMs,
+    delegatedMs: total.delegatedMs + session.delegatedMs,
+    firstContentMs: total.firstContentMs + session.firstContentMs,
     reasoningMs: total.reasoningMs + session.reasoningMs,
     outputMs: total.outputMs + session.outputMs,
+    toolOutputMs: total.toolOutputMs + session.toolOutputMs,
     otherInferenceMs: total.otherInferenceMs + session.otherInferenceMs,
-  }), { inferenceMs: 0, toolMs: 0, reasoningMs: 0, outputMs: 0, otherInferenceMs: 0 })
+  }), { inferenceMs: 0, toolMs: 0, delegatedMs: 0, firstContentMs: 0, reasoningMs: 0, outputMs: 0, toolOutputMs: 0, otherInferenceMs: 0 })
 
   return {
     id: entryName,
@@ -351,7 +430,7 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
     outcome: text(result?.outcome, text(accepted?.outcome)) || null,
     decision: text(review?.decision) || null,
     summary: text(result?.summary, text(accepted?.summary, 'No result recorded yet.')),
-    commit: text(accepted?.commit) || null,
+    commit: text(accepted?.commit, legacyComplete ? text(completedRecord?.commit) : '') || null,
     durationMs: endedMs ? Math.max(0, endedMs - startedMs) : null,
     retryCount,
     compactionCount: artifacts.reduce((total, artifact) => total + artifact.compactionCount, 0),
@@ -389,15 +468,29 @@ function canonicalCycles(cycles: Cycle[]): Cycle[] {
 }
 
 async function loadDashboard() {
-  const sessions = await loadOpenCodeSessions()
+  const sessions = await loadOpenCodeSessions(true)
   const state = await readJson(path.join(runtimeRoot, 'state.json'))
   const active = state?.active as JsonObject | undefined
   const activeLog = await findActiveLog(state)
   const activeDirectory = active ? text(active.directory) : null
   const directoryEntries = await readdir(runtimeRoot, { withFileTypes: true })
-  const cycleDirectories = (await Promise.all(directoryEntries
-    .filter((entry) => entry.isDirectory() && cyclePattern.test(entry.name))
-    .map((entry) => loadCycle(entry.name, activeDirectory, sessions))))
+  const cycleEntries = directoryEntries.filter((entry) => entry.isDirectory() && cyclePattern.test(entry.name))
+  const completedRecords = new Map<string, JsonObject>()
+  const rememberCompleted = (entry: unknown) => {
+    if (!entry || typeof entry !== 'object') return
+    const record = entry as JsonObject
+    const directory = text(record.directory)
+    if (path.dirname(directory) === runtimeRoot && cyclePattern.test(path.basename(directory))) {
+      completedRecords.set(directory, record)
+    }
+  }
+  for (const entry of Array.isArray(state?.history) ? state.history : []) rememberCompleted(entry)
+  const contexts = await Promise.all(cycleEntries.map((entry) => readJson(path.join(runtimeRoot, entry.name, 'context.json'))))
+  for (const context of contexts) {
+    for (const entry of Array.isArray(context?.recent_outcomes) ? context.recent_outcomes : []) rememberCompleted(entry)
+  }
+  const cycleDirectories = (await Promise.all(cycleEntries
+    .map((entry) => loadCycle(entry.name, activeDirectory, sessions, completedRecords.get(path.join(runtimeRoot, entry.name))))))
     .filter((cycle): cycle is Cycle => cycle !== null)
     .sort((a, b) => a.cycle - b.cycle || a.startedAt.localeCompare(b.startedAt))
   const cycles = canonicalCycles(cycleDirectories)

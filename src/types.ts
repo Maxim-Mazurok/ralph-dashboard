@@ -8,8 +8,11 @@ export type SessionSummary = {
   reasoningCount: number
   inferenceMs: number
   toolMs: number
+  delegatedMs: number
+  firstContentMs: number
   reasoningMs: number
   outputMs: number
+  toolOutputMs: number
   otherInferenceMs: number
 }
 
@@ -67,8 +70,11 @@ export type Cycle = {
   timeBreakdown: {
     inferenceMs: number
     toolMs: number
+    delegatedMs: number
+    firstContentMs: number
     reasoningMs: number
     outputMs: number
+    toolOutputMs: number
     otherInferenceMs: number
   }
   phases: Record<PhaseName, { durationMs: number | null; attempts: number }>

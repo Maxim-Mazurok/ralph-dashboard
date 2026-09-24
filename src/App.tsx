@@ -1,8 +1,6 @@
-import { startTransition, useDeferredValue, useEffect, useRef, useState } from 'react'
+import { lazy, startTransition, Suspense, useCallback, useDeferredValue, useEffect, useRef, useState } from 'react'
 import Convert from 'ansi-to-html'
-import ReactMarkdown from 'react-markdown'
-import ReactDiffViewer, { DiffMethod } from 'react-diff-viewer-continued'
-import remarkGfm from 'remark-gfm'
+import type { DiffMethod } from 'react-diff-viewer-continued'
 import {
   Activity, AlertTriangle, Archive, BarChart3, CheckCircle2, Clock3,
   BrainCircuit, FileText, FolderOpen, Network, Pause, Play, Radio, RefreshCw, Search, TimerReset, Trash2, X,
@@ -14,16 +12,22 @@ import {
 import type { Artifact, Cycle, DashboardData, PhaseName, SessionSubagent, SessionSummary, SessionTelemetry } from './types'
 import './App.css'
 
+const ReactDiffViewer = lazy(() => import('react-diff-viewer-continued'))
+const MarkdownViewer = lazy(() => import('./MarkdownViewer'))
+
 const phaseColors: Record<PhaseName, string> = {
   worker: '#d65a31',
   reviewer: '#287271',
   retrospective: '#daa520',
 }
 const telemetryColors = {
+  firstContent: '#8498a0',
   reasoning: '#d65a31',
   output: '#d19a32',
+  toolOutput: '#b38cbd',
   otherInference: '#e4bd52',
   tools: '#287271',
+  delegated: '#4c7180',
 }
 const outcomeColors: Record<string, string> = {
   change: '#287271', investigation: '#d19a32', no_change: '#87908d',
@@ -132,18 +136,18 @@ const splitDiffStyles = {
 function EditDiff({ input, fallback }: { input: unknown; fallback: string }) {
   const values = editValues(input)
   if (!values) return <DiffOutput content={fallback} />
-  return <div className="split-diff"><ReactDiffViewer
+  return <div className="split-diff"><Suspense fallback={<pre>Loading diff…</pre>}><ReactDiffViewer
     oldValue={values.oldValue}
     newValue={values.newValue}
     splitView
-    compareMethod={DiffMethod.CHARS}
+    compareMethod={'diffChars' as DiffMethod}
     showDiffOnly
     extraLinesSurroundingDiff={3}
     leftTitle="Before"
     rightTitle="After"
     useDarkTheme
     styles={splitDiffStyles}
-  /></div>
+  /></Suspense></div>
 }
 
 function firstLine(value: string | undefined): string {
@@ -262,41 +266,45 @@ function App() {
   const [liveLogOpen, setLiveLogOpen] = useState(false)
   const [deletingCycle, setDeletingCycle] = useState(false)
   const [discardingStep, setDiscardingStep] = useState(false)
+  const latestCycleId = useRef('')
+  const loading = useRef(false)
 
-  async function load(showRefreshing = true) {
+  const load = useCallback(async (showRefreshing = true) => {
+    if (loading.current) return
+    loading.current = true
     if (showRefreshing) setRefreshing(true)
     try {
       const response = await fetch('/api/dashboard')
       if (!response.ok) throw new Error(`API returned ${response.status}`)
       const next = await response.json() as DashboardData
+      const previousLatest = latestCycleId.current
+      const nextLatest = next.cycles.at(-1)?.id || ''
+      latestCycleId.current = nextLatest
       startTransition(() => {
         setData(next)
-        setSelectedCycleId((current) => current || next.cycles.at(-1)?.id || '')
+        setSelectedCycleId((current) => !current || current === previousLatest ? nextLatest : current)
         setError('')
       })
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Unable to load Ralph data')
-    } finally { if (showRefreshing) setRefreshing(false) }
-  }
-  useEffect(() => {
-    let cancelled = false
-    fetch('/api/dashboard')
-      .then((response) => {
-        if (!response.ok) throw new Error(`API returned ${response.status}`)
-        return response.json() as Promise<DashboardData>
-      })
-      .then((next) => {
-        if (cancelled) return
-        startTransition(() => {
-          setData(next)
-          setSelectedCycleId(next.cycles.at(-1)?.id || '')
-        })
-      })
-      .catch((caught: unknown) => {
-        if (!cancelled) setError(caught instanceof Error ? caught.message : 'Unable to load Ralph data')
-      })
-    return () => { cancelled = true }
+    } finally {
+      loading.current = false
+      if (showRefreshing) setRefreshing(false)
+    }
   }, [])
+  useEffect(() => {
+    const initial = setTimeout(() => void load(false), 0)
+    const refresh = setInterval(() => {
+      if (!document.hidden) void load(false)
+    }, 10_000)
+    const onVisible = () => { if (!document.hidden) void load(false) }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearTimeout(initial)
+      clearInterval(refresh)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [load])
 
   async function openArtifact(cycle: string, name: string) {
     const terminal = name.endsWith('.log')
@@ -323,6 +331,7 @@ function App() {
       const result = await response.json() as DashboardData | { error?: string }
       if (!response.ok) throw new Error('error' in result && result.error ? result.error : `API returned ${response.status}`)
       const next = result as DashboardData
+      latestCycleId.current = next.cycles.at(-1)?.id || ''
       startTransition(() => {
         setData(next)
         setSelectedCycleId(next.cycles.at(-1)?.id || '')
@@ -343,6 +352,7 @@ function App() {
       const response = await fetch(`/api/cycles/${encodeURIComponent(cycle.id)}/step`, { method: 'DELETE' })
       const result = await response.json() as DashboardData | { error?: string }
       if (!response.ok) throw new Error('error' in result && result.error ? result.error : `API returned ${response.status}`)
+      latestCycleId.current = (result as DashboardData).cycles.at(-1)?.id || ''
       startTransition(() => {
         setData(result as DashboardData)
         setError('')
@@ -370,12 +380,15 @@ function App() {
   })
   const telemetryData = measuredCycles.map((cycle) => ({
     cycle: `#${cycle.cycle}`,
+    firstContent: cycle.timeBreakdown.firstContentMs / 60000,
     reasoning: cycle.timeBreakdown.reasoningMs / 60000,
     output: cycle.timeBreakdown.outputMs / 60000,
+    toolOutput: cycle.timeBreakdown.toolOutputMs / 60000,
     otherInference: cycle.timeBreakdown.otherInferenceMs / 60000,
     tools: cycle.timeBreakdown.toolMs / 60000,
+    delegated: cycle.timeBreakdown.delegatedMs / 60000,
   }))
-  const hasTelemetry = telemetryData.some((point) => point.reasoning + point.output + point.otherInference + point.tools > 0)
+  const hasTelemetry = telemetryData.some((point) => point.firstContent + point.reasoning + point.output + point.toolOutput + point.otherInference + point.tools + point.delegated > 0)
   const outcomeData = Object.entries(data.metrics.outcomes).map(([name, value]) => ({ name: name.replace('_', ' '), key: name, value }))
   const filteredCycles = [...data.cycles].reverse().filter((cycle: Cycle) => `${cycle.cycle} ${cycle.focus} ${cycle.outcome} ${cycle.summary}`.toLowerCase().includes(deferredQuery.toLowerCase()))
   const selected = data.cycles.find((cycle) => cycle.id === selectedCycleId) || filteredCycles[0]
@@ -397,7 +410,7 @@ function App() {
       {error && <div className="inline-error"><AlertTriangle size={16} />Refresh failed: {error}</div>}
 
       <section className="metrics-grid">
-        <Metric icon={CheckCircle2} label="Completed" value={`${data.metrics.completedCycles}`} note={`${data.metrics.totalCycles} cycle directories`} />
+        <Metric icon={CheckCircle2} label="Completed" value={`${data.metrics.completedCycles}`} note={`${data.metrics.totalCycles} distinct cycles`} />
         <Metric icon={Clock3} label="Median cycle" value={duration(data.metrics.medianCycleMs)} note={`P90 ${duration(data.metrics.p90CycleMs)} · approx.`} />
         <Metric icon={TimerReset} label="Needed retry" value={percent(data.metrics.retryRate)} note="Retries or feedback artifacts" />
         <Metric icon={Activity} label="Change outcomes" value={percent(data.metrics.changeRate)} note={`${data.metrics.changedCycles} of ${data.metrics.completedCycles} completed cycles`} />
@@ -417,7 +430,7 @@ function App() {
         </article>
 
         <article className="chart-panel">
-          <div className="panel-title"><div><h3>Outcome mix</h3><p>All observed cycle directories</p></div></div>
+          <div className="panel-title"><div><h3>Outcome mix</h3><p>All observed distinct cycles</p></div></div>
           <ResponsiveContainer width="100%" height={260}><BarChart data={outcomeData} layout="vertical" margin={{ top: 15, right: 22, left: 18, bottom: 0 }}>
             <CartesianGrid stroke="#d8d9d2" horizontal={false} strokeDasharray="2 4" /><XAxis type="number" allowDecimals={false} tickLine={false} axisLine={false} /><YAxis type="category" dataKey="name" width={86} tickLine={false} axisLine={false} /><Tooltip cursor={{ fill: '#efeee8' }} />
             <Bar dataKey="value" radius={[0, 3, 3, 0]} barSize={22}>{outcomeData.map((item) => <Cell key={item.key} fill={outcomeColors[item.key] || '#607176'} />)}</Bar>
@@ -439,24 +452,30 @@ function App() {
         </article>
 
         <article className="chart-panel wide">
-          <div className="panel-title"><div><h3>Inference & tool time per cycle</h3><p>Measured OpenCode intervals, minutes</p></div></div>
+          <div className="panel-title"><div><h3>Model & tool time per cycle</h3><p>OpenCode intervals and estimates, minutes</p></div></div>
           {hasTelemetry ? <ResponsiveContainer width="100%" height={260}><BarChart data={telemetryData} margin={{ top: 12, right: 18, left: -16, bottom: 0 }}>
             <CartesianGrid stroke="#d8d9d2" vertical={false} strokeDasharray="2 4" /><XAxis dataKey="cycle" tickLine={false} axisLine={false} /><YAxis tickLine={false} axisLine={false} unit="m" />
             <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)} min`, String(name).replace(/([A-Z])/g, ' $1').toLowerCase()]} /><Legend iconType="square" formatter={(value) => value.replace(/([A-Z])/g, ' $1').toLowerCase()} />
+            <Bar dataKey="firstContent" stackId="time" fill={telemetryColors.firstContent} />
             <Bar dataKey="reasoning" stackId="time" fill={telemetryColors.reasoning} />
             <Bar dataKey="output" stackId="time" fill={telemetryColors.output} />
+            <Bar dataKey="toolOutput" stackId="time" fill={telemetryColors.toolOutput} />
             <Bar dataKey="otherInference" stackId="time" fill={telemetryColors.otherInference} />
             <Bar dataKey="tools" stackId="time" fill={telemetryColors.tools} />
+            <Bar dataKey="delegated" stackId="time" fill={telemetryColors.delegated} />
           </BarChart></ResponsiveContainer> : <EmptyChart />}
         </article>
 
         <article className="chart-panel phase-summary">
-          <div className="panel-title"><div><h3>How time is classified</h3><p>Provider and tool lifecycle timestamps</p></div></div>
+          <div className="panel-title"><div><h3>How time is classified</h3><p>OpenCode message, part, and tool timestamps</p></div></div>
+          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.firstContent }} /><span>First content</span><strong>estimate</strong></div>
           <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.reasoning }} /><span>Reasoning</span><strong>inference</strong></div>
           <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.output }} /><span>Output</span><strong>inference</strong></div>
+          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.toolOutput }} /><span>Tool-call output</span><strong>estimate</strong></div>
           <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.otherInference }} /><span>Other inference</span><strong>inference</strong></div>
           <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.tools }} /><span>Tool calls</span><strong>execution</strong></div>
-          <p className="method-note">Other inference is model time not covered by reasoning or text-part timestamps. It includes prefill, which OpenCode does not time separately.</p>
+          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.delegated }} /><span>Subagents</span><strong>execution</strong></div>
+          <p className="method-note">First content runs from message start to the first timed text or reasoning part; it includes queueing and prefill. Tool-call output is the gap from the last timed part to tool start. Neither is a provider-measured phase. Tool and subagent execution is removed from inference.</p>
         </article>
       </section>
 
@@ -469,7 +488,7 @@ function App() {
 
         <article className="cycle-detail">{selected ? <>
           <div className="detail-heading"><div><p className="eyebrow">CYCLE {selected.cycle} · {selected.focus.toUpperCase()}</p><h3>{selected.summary}</h3></div><div className="detail-actions"><span className={`outcome ${selected.outcome || selected.status}`}>{(selected.outcome || selected.status).replace('_', ' ')}</span>{data.capabilities?.discardActiveStep && selected.id === data.cycles.at(-1)?.id && selected.status === 'active' && <button className="discard-step" title="Discard this incomplete workflow step" disabled={discardingStep || deletingCycle} onClick={() => void discardStep(selected)}><TimerReset size={15} />{discardingStep ? 'Discarding…' : `Discard ${data.active?.phase || 'step'}`}</button>}{data.capabilities?.deleteActiveCycle && selected.id === data.cycles.at(-1)?.id && selected.status === 'active' && <button className="delete-cycle" title="Delete this unfinished cycle" disabled={deletingCycle || discardingStep} onClick={() => void deleteCycle(selected)}><Trash2 size={15} />{deletingCycle ? 'Deleting…' : 'Delete cycle'}</button>}</div></div>
-          <div className="cycle-facts"><div><span>Elapsed</span><strong>{duration(selected.durationMs)}</strong></div><div><span>Inference</span><strong>{telemetryDuration(selected.timeBreakdown.inferenceMs)}</strong><small>Reasoning {telemetryDuration(selected.timeBreakdown.reasoningMs)} · output {telemetryDuration(selected.timeBreakdown.outputMs)}</small></div><div><span>Tool calls</span><strong>{telemetryDuration(selected.timeBreakdown.toolMs)}</strong></div><div><span>Retries</span><strong>{selected.retryCount}</strong></div><div><span>Compactions</span><strong>{selected.compactionCount}</strong><small>W {selected.artifacts.filter((file) => file.name.startsWith('worker-')).reduce((sum, file) => sum + file.compactionCount, 0)} · R {selected.artifacts.filter((file) => file.name.startsWith('reviewer-')).reduce((sum, file) => sum + file.compactionCount, 0)} · Retro {selected.artifacts.filter((file) => file.name.startsWith('retrospective-')).reduce((sum, file) => sum + file.compactionCount, 0)}</small></div><div><span>Peak context</span><strong>{tokens(selected.maxContextTokens)} / {tokens(selected.contextLimit)}</strong><small>{typeof selected.maxContextTokens === 'number' && selected.contextLimit ? percent(selected.maxContextTokens / selected.contextLimit) : 'Session unavailable'}</small></div><div><span>Review</span><strong>{selected.decision || '—'}</strong></div><div><span>Commit</span><strong className="mono">{selected.commit?.slice(0, 8) || '—'}</strong></div></div>
+          <div className="cycle-facts"><div><span>Elapsed</span><strong>{duration(selected.durationMs)}</strong></div><div><span>Inference</span><strong>{telemetryDuration(selected.timeBreakdown.inferenceMs)}</strong><small>First content {telemetryDuration(selected.timeBreakdown.firstContentMs)} · reasoning {telemetryDuration(selected.timeBreakdown.reasoningMs)} · output {telemetryDuration(selected.timeBreakdown.outputMs)} · tool-call output {telemetryDuration(selected.timeBreakdown.toolOutputMs)}</small></div><div><span>Tool calls</span><strong>{telemetryDuration(selected.timeBreakdown.toolMs)}</strong><small>Subagents {telemetryDuration(selected.timeBreakdown.delegatedMs)}</small></div><div><span>Retries</span><strong>{selected.retryCount}</strong></div><div><span>Compactions</span><strong>{selected.compactionCount}</strong><small>W {selected.artifacts.filter((file) => file.name.startsWith('worker-')).reduce((sum, file) => sum + file.compactionCount, 0)} · R {selected.artifacts.filter((file) => file.name.startsWith('reviewer-')).reduce((sum, file) => sum + file.compactionCount, 0)} · Retro {selected.artifacts.filter((file) => file.name.startsWith('retrospective-')).reduce((sum, file) => sum + file.compactionCount, 0)}</small></div><div><span>Peak context</span><strong>{tokens(selected.maxContextTokens)} / {tokens(selected.contextLimit)}</strong><small>{typeof selected.maxContextTokens === 'number' && selected.contextLimit ? percent(selected.maxContextTokens / selected.contextLimit) : 'Session unavailable'}</small></div><div><span>Review</span><strong>{selected.decision || '—'}</strong></div><div><span>Commit</span><strong className="mono">{selected.commit?.slice(0, 8) || '—'}</strong></div></div>
           <div className="role-context" aria-label="Peak context by role">{(Object.keys(phaseColors) as PhaseName[]).map((role) => { const session = peakSession(selected.artifacts, role); const usage = session && contextPercent(session); return <div key={role}><span className="swatch" style={{ background: phaseColors[role] }} /><strong>{role}</strong><span>{session ? `${tokens(session.maxContextTokens)} / ${tokens(session.contextLimit)}` : 'No matched session'}</span><div className="context-track"><span style={{ width: usage || '0%', background: phaseColors[role] }} /></div><small>{usage || '—'}</small></div> })}</div>
           <div className="artifact-heading"><h4><FolderOpen size={17} />Artifacts</h4><span>{selected.artifacts.length} files</span></div>
           <div className="artifact-grid">{selected.artifacts.map((file) => <button key={file.name} onClick={() => void openArtifact(selected.id, file.name)}><FileText size={17} /><span><strong>{file.name}</strong><small>{bytes(file.size)} · {date(file.modifiedAt)}{file.name.endsWith('.log') ? ` · ${file.compactionCount} compact${file.session ? ` · ${tokens(file.session.maxContextTokens)}/${tokens(file.session.contextLimit)} ctx` : ' · no session'}` : ''}</small></span></button>)}</div>
@@ -481,7 +500,7 @@ function App() {
 
     <footer>Updated {date(data.generatedAt)} · Filesystem timings are approximate</footer>
     {liveLogOpen && <LiveLogDrawer onClose={() => setLiveLogOpen(false)} />}
-    {artifact && <div className="drawer-backdrop" onMouseDown={() => setArtifact(null)}><aside className={artifact.terminal ? 'drawer terminal-drawer' : 'drawer'} onMouseDown={(event) => event.stopPropagation()}><header><div><FileText size={18} /><strong>{artifact.title}</strong>{artifact.session && <span className="drawer-context">{tokens(artifact.session.maxContextTokens)} / {tokens(artifact.session.contextLimit)} context</span>}</div><button className="icon-button" title="Close viewer" onClick={() => setArtifact(null)}><X size={18} /></button></header>{artifact.terminal ? <TerminalOutput content={artifact.content} session={artifact.session} /> : artifact.markdown ? <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.content}</ReactMarkdown></div> : <pre>{artifact.content}</pre>}</aside></div>}
+    {artifact && <div className="drawer-backdrop" onMouseDown={() => setArtifact(null)}><aside className={artifact.terminal ? 'drawer terminal-drawer' : 'drawer'} onMouseDown={(event) => event.stopPropagation()}><header><div><FileText size={18} /><strong>{artifact.title}</strong>{artifact.session && <span className="drawer-context">{tokens(artifact.session.maxContextTokens)} / {tokens(artifact.session.contextLimit)} context</span>}</div><button className="icon-button" title="Close viewer" onClick={() => setArtifact(null)}><X size={18} /></button></header>{artifact.terminal ? <TerminalOutput content={artifact.content} session={artifact.session} /> : artifact.markdown ? <div className="markdown-content"><Suspense fallback={<pre>Loading markdown…</pre>}><MarkdownViewer content={artifact.content} /></Suspense></div> : <pre>{artifact.content}</pre>}</aside></div>}
   </div>
 }
 

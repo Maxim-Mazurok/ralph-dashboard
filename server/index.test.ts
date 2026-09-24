@@ -6,6 +6,43 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
+test('counts legacy cycles only when a later context records their completion', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-legacy-'))
+  const runtime = path.join(root, '.ralph/runtime')
+  const finished = path.join(runtime, 'cycle-1-1000')
+  const interrupted = path.join(runtime, 'cycle-2-2000')
+  const active = path.join(runtime, 'cycle-3-3000')
+  await Promise.all([finished, interrupted, active].map((directory) => mkdir(directory, { recursive: true })))
+  await writeFile(path.join(runtime, 'state.json'), JSON.stringify({ completed: 1, history: [], active: { directory: active } }))
+  for (const directory of [finished, interrupted, active]) {
+    await writeFile(path.join(directory, 'result.json'), JSON.stringify({ outcome: 'change', summary: 'Work done' }))
+    await writeFile(path.join(directory, 'review.json'), JSON.stringify({ decision: 'accept' }))
+  }
+  await writeFile(path.join(interrupted, 'context.json'), JSON.stringify({
+    cycle: 2, recent_outcomes: [{ cycle: 1, directory: finished, outcome: 'change', commit: 'abc123' }],
+  }))
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?legacy=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as { metrics: { completedCycles: number; totalCycles: number }; cycles: Array<{ status: string; commit: string | null }> }
+    assert.equal(dashboard.metrics.totalCycles, 3)
+    assert.equal(dashboard.metrics.completedCycles, 1)
+    assert.deepEqual(dashboard.cycles.map((cycle) => cycle.status), ['complete', 'incomplete', 'active'])
+    assert.equal(dashboard.cycles[0].commit, 'abc123')
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('deletes only the current unfinished cycle through the project reset command', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-reset-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-5-1000')
@@ -122,6 +159,18 @@ test('streams the newest active role log when state has no phase', async () => {
       .then((response) => response.json()) as { active: Record<string, unknown> }
     assert.deepEqual(dashboard.active, { cycle: 7, phase: 'worker', attempt: 1, logFile: 'worker-1.log' })
 
+    const nextCycle = path.join(root, '.ralph/runtime/cycle-8-2000')
+    await mkdir(nextCycle)
+    await writeFile(path.join(nextCycle, 'worker-1.log'), 'next cycle output\n')
+    await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({
+      completed: 7,
+      active: { directory: nextCycle, phase: 'worker', attempt: 1, cycle: 8 },
+    }))
+    const updated = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as { active: Record<string, unknown>; cycles: Array<{ id: string }> }
+    assert.equal(updated.cycles.at(-1)?.id, 'cycle-8-2000')
+    assert.equal(updated.active.cycle, 8)
+
     const controller = new AbortController()
     const response = await fetch(`http://127.0.0.1:${address.port}/api/live-log`, { signal: controller.signal })
     const reader = response.body!.getReader()
@@ -131,7 +180,7 @@ test('streams the newest active role log when state has no phase', async () => {
     const payload = JSON.parse(frame.match(/^data: (.+)$/m)?.[1] || '{}')
     assert.equal(payload.file, 'worker-1.log')
     assert.equal(payload.phase, 'worker')
-    assert.equal(payload.content, 'live worker output\n')
+    assert.equal(payload.content, 'next cycle output\n')
   } finally {
     server.close()
     await rm(root, { recursive: true, force: true })
@@ -253,11 +302,11 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
   database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-1', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 500), Math.round(logTime + 7_200_000), null, 'Worker')
   database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-child', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 900), Math.round(logTime + 7_200_000), 'session-1', 'Inspect API behavior (@explore subagent)')
   database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-grandchild', root, JSON.stringify({ id: 'MODEL', providerID: 'historical-provider' }), Math.round(promptTime + 1100), Math.round(logTime + 7_200_000), 'session-child', 'Trace nested behavior (@explore subagent)')
-  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-1', 'session-1', JSON.stringify({ role: 'assistant', tokens: { total: 64000, reasoning: 1200 }, time: { created: 10000, completed: 20000 } }))
+  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-1', 'session-1', JSON.stringify({ role: 'assistant', tokens: { total: 64000, reasoning: 1200 }, time: { created: 10000, completed: 24000 } }))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-1', 'message-1', 'session-1', JSON.stringify({ type: 'reasoning', text: 'Structured model reasoning', time: { start: 11000, end: 15000 } }), Math.round(promptTime + 600))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-2', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'edit', state: { status: 'completed', title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', time: { start: 21000, end: 24000 }, metadata: { diff: '@@ -1 +1 @@\n-old\n+new' } } }), Math.round(promptTime + 700))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-3', 'message-1', 'session-1', JSON.stringify({ type: 'text', text: 'Observed result', time: { start: 15000, end: 17000 } }), Math.round(promptTime + 800))
-  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-task', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'task', state: { status: 'completed', title: 'Inspect API behavior', input: { prompt: 'Inspect the API' }, output: '<task id="session-child" state="completed"><task_result>Child session finding</task_result></task>' } }), Math.round(promptTime + 850))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-task', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'task', state: { status: 'completed', title: 'Inspect API behavior', input: { prompt: 'Inspect the API' }, output: '<task id="session-child" state="completed"><task_result>Child session finding</task_result></task>', time: { start: 25000, end: 265000 } } }), Math.round(promptTime + 850))
   database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-child', 'session-child', JSON.stringify({ role: 'assistant' }))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-child', 'message-child', 'session-child', JSON.stringify({ type: 'text', text: 'Child session finding' }), Math.round(promptTime + 1000))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-child-task', 'message-child', 'session-child', JSON.stringify({ type: 'tool', tool: 'task', state: { status: 'completed', title: 'Trace nested behavior', input: { prompt: 'Trace nested behavior' }, output: '<task id="session-grandchild" state="completed"><task_result>Nested result</task_result></task>' } }), Math.round(promptTime + 1050))
@@ -283,20 +332,23 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
     assert.equal(dashboard.cycles[0].contextLimit, 100000)
     assert.deepEqual(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.session, {
       model: 'MODEL', maxContextTokens: 64000, contextLimit: 100000, reasoningTokens: 1200, reasoningCount: 1,
-      inferenceMs: 10000, toolMs: 3000, reasoningMs: 4000, outputMs: 2000, otherInferenceMs: 4000,
+      inferenceMs: 11000, toolMs: 3000, delegatedMs: 240000, firstContentMs: 1000,
+      reasoningMs: 4000, outputMs: 2000, toolOutputMs: 4000, otherInferenceMs: 0,
     })
     assert.deepEqual(dashboard.cycles[0].timeBreakdown, {
-      inferenceMs: 10000, toolMs: 3000, reasoningMs: 4000, outputMs: 2000, otherInferenceMs: 4000,
+      inferenceMs: 11000, toolMs: 3000, delegatedMs: 240000, firstContentMs: 1000,
+      reasoningMs: 4000, outputMs: 2000, toolOutputMs: 4000, otherInferenceMs: 0,
     })
 
     const telemetry = await fetch(`http://127.0.0.1:${address.port}/api/artifact-telemetry?cycle=cycle-4-1000&file=worker-1.log`)
-      .then((response) => response.json()) as { reasoning: unknown[]; events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown>> } } }> } } }>; subagents: unknown[] }
+      .then((response) => response.json()) as { toolMs: number; reasoning: unknown[]; events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown>> } } }> } } }>; subagents: unknown[] }
     assert.deepEqual(telemetry.reasoning, [{ text: 'Structured model reasoning', startedAt: 11000, endedAt: 15000 }])
     assert.deepEqual(telemetry.events.map((event) => event.type), ['reasoning', 'tool', 'text', 'tool'])
     assert.deepEqual(telemetry.events[1], {
       id: 'part-2', type: 'tool', createdAt: Math.round(promptTime + 700), tool: 'edit', status: 'completed',
       title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', diff: '@@ -1 +1 @@\n-old\n+new',
     })
+    assert.equal(telemetry.toolMs, 3000)
     assert.equal(telemetry.subagents.length, 0)
     const child = telemetry.events[3].subagent
     assert.equal(child?.title, 'Inspect API behavior (@explore subagent)')
