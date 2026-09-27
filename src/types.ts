@@ -6,6 +6,7 @@ export type SessionSummary = {
   contextLimit: number | null
   reasoningTokens: number
   reasoningCount: number
+  compactionCount: number
   inferenceMs: number
   toolMs: number
   delegatedMs: number
@@ -28,7 +29,7 @@ export type SessionTelemetry = SessionSummary & {
   reasoning: Array<{ text: string; startedAt: number | null; endedAt: number | null }>
   events: Array<{
     id: string
-    type: 'reasoning' | 'text' | 'tool'
+    type: 'reasoning' | 'text' | 'tool' | 'compaction'
     createdAt: number
     text?: string
     tool?: string

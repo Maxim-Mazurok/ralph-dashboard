@@ -1,10 +1,45 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+
+test('keeps the production server process alive after listening', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-startup-'))
+  await mkdir(path.join(root, '.ralph/runtime'), { recursive: true })
+  const child = spawn(process.execPath, ['--import', 'tsx', path.join(import.meta.dirname, 'index.ts')], {
+    cwd: path.join(import.meta.dirname, '..'),
+    env: {
+      ...process.env,
+      HOST: '127.0.0.1',
+      NODE_ENV: '',
+      PORT: '0',
+      RALPH_PROJECT_PATH: root,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Server did not start')), 5000)
+      child.once('exit', (code, signal) => reject(new Error(`Server exited during startup (${code ?? signal})`)))
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (!chunk.toString().includes('Ralph dashboard listening')) return
+        clearTimeout(timeout)
+        resolve()
+      })
+    })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal(child.exitCode, null)
+  } finally {
+    child.kill()
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()))
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test('counts legacy cycles only when a later context records their completion', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-legacy-'))
@@ -187,6 +222,37 @@ test('streams the newest active role log when state has no phase', async () => {
   }
 })
 
+test('reports a pending retrospective as an active cycle', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-retrospective-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-84-1000')
+  await mkdir(cycle, { recursive: true })
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({
+    completed: 84,
+    history: [],
+    pendingRetrospective: { directory: cycle, cycle: 84, attempt: 1 },
+  }))
+  await writeFile(path.join(cycle, 'context.json'), JSON.stringify({ cycle: 84, focus: 'workflow' }))
+  await writeFile(path.join(cycle, 'retrospective-1.log'), 'retrospective in progress\n')
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?pending-retrospective=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as { active: Record<string, unknown> | null; cycles: Array<{ status: string }> }
+    assert.deepEqual(dashboard.active, { cycle: 84, phase: 'retrospective', attempt: 1, logFile: 'retrospective-1.log' })
+    assert.equal(dashboard.cycles[0].status, 'active')
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('streams OpenCode tool updates when the role log is unchanged', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-live-session-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-8-1000')
@@ -307,6 +373,11 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-2', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'edit', state: { status: 'completed', title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', time: { start: 21000, end: 24000 }, metadata: { diff: '@@ -1 +1 @@\n-old\n+new' } } }), Math.round(promptTime + 700))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-3', 'message-1', 'session-1', JSON.stringify({ type: 'text', text: 'Observed result', time: { start: 15000, end: 17000 } }), Math.round(promptTime + 800))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-task', 'message-1', 'session-1', JSON.stringify({ type: 'tool', tool: 'task', state: { status: 'completed', title: 'Inspect API behavior', input: { prompt: 'Inspect the API' }, output: '<task id="session-child" state="completed"><task_result>Child session finding</task_result></task>', time: { start: 25000, end: 265000 } } }), Math.round(promptTime + 850))
+  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-compaction-1', 'session-1', JSON.stringify({ role: 'assistant', mode: 'compaction', agent: 'compaction', summary: true }))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-compaction-reasoning-1', 'message-compaction-1', 'session-1', JSON.stringify({ type: 'reasoning', text: 'We need to produce structured summary.' }), Math.round(promptTime + 860))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-compaction-text-1', 'message-compaction-1', 'session-1', JSON.stringify({ type: 'text', text: 'First compacted context' }), Math.round(promptTime + 870))
+  database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-compaction-2', 'session-1', JSON.stringify({ role: 'assistant', mode: 'compaction', agent: 'compaction', summary: true }))
+  database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-compaction-text-2', 'message-compaction-2', 'session-1', JSON.stringify({ type: 'text', text: 'Second compacted context' }), Math.round(promptTime + 880))
   database.prepare('INSERT INTO message VALUES (?, ?, ?)').run('message-child', 'session-child', JSON.stringify({ role: 'assistant' }))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-child', 'message-child', 'session-child', JSON.stringify({ type: 'text', text: 'Child session finding' }), Math.round(promptTime + 1000))
   database.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run('part-child-task', 'message-child', 'session-child', JSON.stringify({ type: 'tool', tool: 'task', state: { status: 'completed', title: 'Trace nested behavior', input: { prompt: 'Trace nested behavior' }, output: '<task id="session-grandchild" state="completed"><task_result>Nested result</task_result></task>' } }), Math.round(promptTime + 1050))
@@ -327,11 +398,13 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
 
   try {
     const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
-      .then((response) => response.json()) as { cycles: Array<{ maxContextTokens: number; contextLimit: number; timeBreakdown: Record<string, number>; artifacts: Array<{ name: string; session: Record<string, unknown> | null }> }> }
+      .then((response) => response.json()) as { cycles: Array<{ compactionCount: number; maxContextTokens: number; contextLimit: number; timeBreakdown: Record<string, number>; artifacts: Array<{ name: string; compactionCount: number; session: Record<string, unknown> | null }> }> }
     assert.equal(dashboard.cycles[0].maxContextTokens, 64000)
     assert.equal(dashboard.cycles[0].contextLimit, 100000)
+    assert.equal(dashboard.cycles[0].compactionCount, 2)
+    assert.equal(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.compactionCount, 2)
     assert.deepEqual(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.session, {
-      model: 'MODEL', maxContextTokens: 64000, contextLimit: 100000, reasoningTokens: 1200, reasoningCount: 1,
+      model: 'MODEL', maxContextTokens: 64000, contextLimit: 100000, reasoningTokens: 1200, reasoningCount: 1, compactionCount: 2,
       inferenceMs: 11000, toolMs: 3000, delegatedMs: 240000, firstContentMs: 1000,
       reasoningMs: 4000, outputMs: 2000, toolOutputMs: 4000, otherInferenceMs: 0,
     })
@@ -343,12 +416,14 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
     const telemetry = await fetch(`http://127.0.0.1:${address.port}/api/artifact-telemetry?cycle=cycle-4-1000&file=worker-1.log`)
       .then((response) => response.json()) as { toolMs: number; reasoning: unknown[]; events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown> & { subagent?: { title: string; session: { events: Array<Record<string, unknown>> } } }> } } }>; subagents: unknown[] }
     assert.deepEqual(telemetry.reasoning, [{ text: 'Structured model reasoning', startedAt: 11000, endedAt: 15000 }])
-    assert.deepEqual(telemetry.events.map((event) => event.type), ['reasoning', 'tool', 'text', 'tool'])
+    assert.deepEqual(telemetry.events.map((event) => event.type), ['reasoning', 'tool', 'text', 'tool', 'compaction', 'compaction'])
     assert.deepEqual(telemetry.events[1], {
       id: 'part-2', type: 'tool', createdAt: Math.round(promptTime + 700), tool: 'edit', status: 'completed',
       title: 'Edit file', input: { filePath: 'example.ts', oldString: 'old', newString: 'new' }, output: 'Done', diff: '@@ -1 +1 @@\n-old\n+new',
     })
     assert.equal(telemetry.toolMs, 3000)
+    assert.equal(telemetry.events[4].text, 'First compacted context')
+    assert.equal(telemetry.events[5].text, 'Second compacted context')
     assert.equal(telemetry.subagents.length, 0)
     const child = telemetry.events[3].subagent
     assert.equal(child?.title, 'Inspect API behavior (@explore subagent)')

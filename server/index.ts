@@ -24,11 +24,11 @@ const execFileAsync = promisify(execFile)
 
 type JsonObject = Record<string, unknown>
 type TimeBreakdown = { inferenceMs: number; toolMs: number; delegatedMs: number; firstContentMs: number; reasoningMs: number; outputMs: number; toolOutputMs: number; otherInferenceMs: number }
-type SessionSummary = TimeBreakdown & { model: string; maxContextTokens: number; contextLimit: number | null; reasoningTokens: number; reasoningCount: number }
+type SessionSummary = TimeBreakdown & { model: string; maxContextTokens: number; contextLimit: number | null; reasoningTokens: number; reasoningCount: number; compactionCount: number }
 type ReasoningPart = { text: string; startedAt: number | null; endedAt: number | null }
 type SessionEvent = {
   id: string
-  type: 'reasoning' | 'text' | 'tool'
+  type: 'reasoning' | 'text' | 'tool' | 'compaction'
   createdAt: number
   text?: string
   tool?: string
@@ -149,7 +149,7 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
       sessions.set(String(row.id), {
         id: String(row.id), parentId: row.parent_id ? String(row.parent_id) : null, title: text(row.title, 'Subagent'),
         createdAt: Number(row.time_created), updatedAt: Number(row.time_updated), model: modelId || 'unknown',
-        maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0,
+        maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0, compactionCount: 0,
         inferenceMs: 0, toolMs: 0, delegatedMs: 0, firstContentMs: 0, reasoningMs: 0, outputMs: 0, toolOutputMs: 0, otherInferenceMs: 0, reasoning: [], events: [],
       })
     }
@@ -157,6 +157,7 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
     // so subtract tool intervals before classifying model time.
     const messages = database.prepare(`
       SELECT m.id, m.session_id,
+        json_extract(m.data, '$.mode') AS mode,
         json_extract(m.data, '$.tokens.total') AS total_tokens,
         json_extract(m.data, '$.tokens.reasoning') AS reasoning_tokens,
         json_extract(m.data, '$.time.created') AS started_at,
@@ -170,6 +171,7 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
       SELECT p.message_id,
         json_extract(p.data, '$.type') AS type,
         json_extract(p.data, '$.tool') AS tool,
+        json_extract(m.data, '$.mode') AS message_mode,
         length(trim(COALESCE(json_extract(p.data, '$.text'), ''))) AS content_length,
         json_extract(p.data, '$.time.start') AS started_at,
         json_extract(p.data, '$.time.end') AS ended_at,
@@ -187,20 +189,22 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
         partsByMessage.set(id, group)
       }
       const type = String(row.type)
+      const isCompaction = row.message_mode === 'compaction'
       const start = Number(type === 'tool' ? row.tool_started_at : row.started_at)
       const end = Number(type === 'tool' ? row.tool_ended_at : row.ended_at)
-      if (type === 'reasoning' && Number(row.content_length) > 0) {
+      if (!isCompaction && type === 'reasoning' && Number(row.content_length) > 0) {
         const session = sessions.get(sessionByMessage.get(id) || '')
         if (session) session.reasoningCount++
       }
       if (!start || !Number.isFinite(end) || end < start) continue
-      if (type === 'reasoning' && Number(row.content_length) > 0) group.reasoning.push({ start, end })
-      if (type === 'text' && Number(row.content_length) > 0) group.output.push({ start, end })
+      if (!isCompaction && type === 'reasoning' && Number(row.content_length) > 0) group.reasoning.push({ start, end })
+      if (!isCompaction && type === 'text' && Number(row.content_length) > 0) group.output.push({ start, end })
       if (type === 'tool') group[row.tool === 'task' ? 'tasks' : 'tools'].push({ start, end })
     }
     for (const row of messages) {
       const session = sessions.get(String(row.session_id))
       if (!session) continue
+      if (row.mode === 'compaction') session.compactionCount++
       session.maxContextTokens = Math.max(session.maxContextTokens, Number(row.total_tokens) || 0)
       session.reasoningTokens += Number(row.reasoning_tokens) || 0
       const group = partsByMessage.get(String(row.id)) || { reasoning: [], output: [], tools: [], tasks: [] }
@@ -231,7 +235,7 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
       session.otherInferenceMs += Math.max(0, inference - firstContent - reasoning - output - toolOutput)
     }
     if (summaryOnly) return [...sessions.values()]
-    const parts = database.prepare("SELECT p.id, p.session_id, p.time_created, p.data, m.data AS message_data FROM part p JOIN session s ON s.id = p.session_id JOIN message m ON m.id = p.message_id WHERE s.directory = ? ORDER BY p.time_created, p.id").all(projectRoot) as Array<Record<string, unknown>>
+    const parts = database.prepare("SELECT p.id, p.message_id, p.session_id, p.time_created, p.data, m.data AS message_data FROM part p JOIN session s ON s.id = p.session_id JOIN message m ON m.id = p.message_id WHERE s.directory = ? ORDER BY p.time_created, p.id").all(projectRoot) as Array<Record<string, unknown>>
     for (const row of parts) {
       const session = sessions.get(String(row.session_id))
       if (!session) continue
@@ -239,6 +243,12 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
       const message = JSON.parse(text(row.message_data, '{}')) as JsonObject
       if (message.role !== 'assistant') continue
       const partType = text(part.type)
+      if (message.mode === 'compaction') {
+        if (partType !== 'text') continue
+        const partText = text(part.text).trim()
+        if (partText) session.events.push({ id: String(row.id), type: 'compaction', createdAt: Number(row.time_created), text: partText })
+        continue
+      }
       if (partType === 'tool') {
         const state = part.state as JsonObject | undefined
         const metadata = state?.metadata as JsonObject | undefined
@@ -278,8 +288,8 @@ function matchingSession(prompt: Artifact | undefined, sessions: OpenCodeSession
 }
 
 function sessionSummary(session: OpenCodeSession): SessionSummary {
-  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs } = session
-  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs }
+  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, compactionCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs } = session
+  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, compactionCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs }
 }
 
 function sessionTelemetry(session: OpenCodeSession, sessions: OpenCodeSession[]): SessionTelemetry {
@@ -370,7 +380,10 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
     const prompt = artifacts.find((item) => item.name === artifact.name.replace(/\.log$/, '.md'))
     const session = matchingSession(prompt, sessions)
     artifact.session = session ? sessionSummary(session) : null
-    if (session) matchedSessions.set(session.id, session)
+    if (session) {
+      artifact.compactionCount = Math.max(artifact.compactionCount, session.compactionCount)
+      matchedSessions.set(session.id, session)
+    }
   }
 
   const context = await readJson(path.join(directory, 'context.json'))
@@ -471,8 +484,10 @@ async function loadDashboard() {
   const sessions = await loadOpenCodeSessions(true)
   const state = await readJson(path.join(runtimeRoot, 'state.json'))
   const active = state?.active as JsonObject | undefined
+  const pendingRetrospective = state?.pendingRetrospective as JsonObject | undefined
+  const running = active || pendingRetrospective
   const activeLog = await findActiveLog(state)
-  const activeDirectory = active ? text(active.directory) : null
+  const activeDirectory = running ? text(running.directory) : null
   const directoryEntries = await readdir(runtimeRoot, { withFileTypes: true })
   const cycleEntries = directoryEntries.filter((entry) => entry.isDirectory() && cyclePattern.test(entry.name))
   const completedRecords = new Map<string, JsonObject>()
@@ -511,10 +526,10 @@ async function loadDashboard() {
     project: { name: path.basename(projectRoot), path: projectRoot, ralphPath: ralphRoot },
     capabilities: { deleteActiveCycle: true, discardActiveStep: true },
     generatedAt: new Date().toISOString(),
-    active: active ? {
-      phase: text(active.phase, activeLog?.phase),
-      attempt: Number(active.attempt || activeLog?.attempt || 1),
-      cycle: Number(active.cycle || activeLog?.cycle || cycles.at(-1)?.cycle || 0),
+    active: running ? {
+      phase: active ? text(active.phase, activeLog?.phase) : 'retrospective',
+      attempt: Number(running.attempt || activeLog?.attempt || 1),
+      cycle: Number(running.cycle || activeLog?.cycle || cycles.at(-1)?.cycle || 0),
       logFile: activeLog?.file || null,
     } : null,
     metrics: {
@@ -684,7 +699,7 @@ app.get('/api/live-log', async (request, response) => {
         attempt: activeLog.attempt,
         file: activeLog.file,
         content: tail,
-        compactionCount: countCompactions(contents.toString('utf8')),
+        compactionCount: Math.max(countCompactions(contents.toString('utf8')), session?.compactionCount || 0),
         session: session ? sessionTelemetry(session, sessions) : null,
         size: details.size,
         truncated: contents.length > liveLogLimit,
@@ -716,11 +731,11 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
   response.status(500).json({ error: error instanceof Error ? error.message : 'Unexpected error' })
 })
 
-if (process.env.NODE_ENV !== 'test') {
-  app.listen(port, host, () => {
+const server = process.env.NODE_ENV !== 'test'
+  ? app.listen(port, host, () => {
     console.log(`Ralph dashboard listening on http://${host}:${port}`)
     console.log(`Reading: ${ralphRoot}`)
   })
-}
+  : null
 
-export { app }
+export { app, server }

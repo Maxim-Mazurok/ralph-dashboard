@@ -178,11 +178,13 @@ function SubagentOutput({ subagent, live }: { subagent: SessionSubagent; live: b
 function TerminalOutput({ content, session, outputRef, live = false }: { content: string; session: SessionTelemetry | null; outputRef?: React.RefObject<HTMLDivElement | null>; live?: boolean }) {
   const events = session?.events || []
   const subagents = session?.subagents || []
-  const hasPendingTool = events.some((event) => event.type === 'tool' && !['completed', 'error'].includes(event.status || 'pending'))
   return <div className="terminal-output" ref={outputRef}>
     {events.length || subagents.length ? <div className="session-timeline">{events.map((event) => {
       if (event.type === 'reasoning') {
         return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="reasoning-block"><summary><BrainCircuit size={13} /><span className="summary-label">Thinking</span><span className="summary-preview">{firstLine(event.text)}</span></summary><pre>{event.text}</pre></details></div>
+      }
+      if (event.type === 'compaction') {
+        return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="compaction-block"><summary><Archive size={13} /><span className="summary-label">Context compacted</span><span className="summary-preview">Summary preserved for continuation</span></summary><pre>{event.text}</pre></details></div>
       }
       if (event.type === 'text') return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><pre className="assistant-output">{event.text}</pre></div>
       if (event.subagent) return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><SubagentOutput subagent={event.subagent} live={live} /></div>
@@ -194,7 +196,7 @@ function TerminalOutput({ content, session, outputRef, live = false }: { content
           {event.output && <><strong>{event.status === 'error' ? 'Error' : 'Output'}</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(event.output) }} /></>}
         </div>
       </details></div>
-    })}{live && hasPendingTool && <div className="live-pending-output"><strong>Streaming</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(liveTail(content)) }} /></div>}
+    })}{live && content && <div className="live-pending-output"><strong>Live output</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(liveTail(content)) }} /></div>}
       {subagents.map((subagent) => <SubagentOutput subagent={subagent} live={live} key={subagent.id} />)}
     </div> : <pre dangerouslySetInnerHTML={{ __html: terminalHtml(content) }} />}
   </div>
