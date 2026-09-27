@@ -86,6 +86,7 @@ export type DashboardData = {
   project: { name: string; path: string; ralphPath: string }
   capabilities?: { deleteActiveCycle: boolean; discardActiveStep: boolean }
   generatedAt: string
+  loopRunning: boolean
   active: { phase: string; attempt: number; cycle: number; logFile: string | null } | null
   metrics: {
     totalCycles: number

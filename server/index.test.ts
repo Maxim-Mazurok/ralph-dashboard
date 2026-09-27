@@ -202,7 +202,7 @@ test('streams the newest active role log when state has no phase', async () => {
       active: { directory: nextCycle, phase: 'worker', attempt: 1, cycle: 8 },
     }))
     const updated = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
-      .then((response) => response.json()) as { active: Record<string, unknown>; cycles: Array<{ id: string }> }
+      .then((response) => response.json()) as { active: Record<string, unknown>; cycles: Array<{ id: string }>; loopRunning: boolean }
     assert.equal(updated.cycles.at(-1)?.id, 'cycle-8-2000')
     assert.equal(updated.active.cycle, 8)
 
@@ -216,6 +216,14 @@ test('streams the newest active role log when state has no phase', async () => {
     assert.equal(payload.file, 'worker-1.log')
     assert.equal(payload.phase, 'worker')
     assert.equal(payload.content, 'next cycle output\n')
+    assert.equal(payload.running, false)
+    assert.equal(updated.loopRunning, false)
+
+    await mkdir(path.join(root, '.ralph/runtime/lock'))
+    await writeFile(path.join(root, '.ralph/runtime/lock/pid'), String(process.pid))
+    const running = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as { loopRunning: boolean }
+    assert.equal(running.loopRunning, true)
   } finally {
     server.close()
     await rm(root, { recursive: true, force: true })

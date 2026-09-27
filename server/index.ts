@@ -323,6 +323,18 @@ function sessionTelemetry(session: OpenCodeSession, sessions: OpenCodeSession[])
   }
 }
 
+// The coordinator removes its lock on exit, but a killed process leaves a stale lock behind.
+async function loopRunning(): Promise<boolean> {
+  try {
+    const pid = Number(await readFile(path.join(runtimeRoot, 'lock', 'pid'), 'utf8'))
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null> {
   const active = state?.active as JsonObject | undefined
   const pending = state?.pendingRetrospective as JsonObject | undefined
@@ -526,6 +538,7 @@ async function loadDashboard() {
     project: { name: path.basename(projectRoot), path: projectRoot, ralphPath: ralphRoot },
     capabilities: { deleteActiveCycle: true, discardActiveStep: true },
     generatedAt: new Date().toISOString(),
+    loopRunning: await loopRunning(),
     active: running ? {
       phase: active ? text(active.phase, activeLog?.phase) : 'retrospective',
       attempt: Number(running.attempt || activeLog?.attempt || 1),
@@ -694,6 +707,7 @@ app.get('/api/live-log', async (request, response) => {
       const session = matchingSession(promptArtifact, sessions)
       const payload = JSON.stringify({
         active: true,
+        running: await loopRunning(),
         cycle: activeLog.cycle,
         phase: activeLog.phase,
         attempt: activeLog.attempt,

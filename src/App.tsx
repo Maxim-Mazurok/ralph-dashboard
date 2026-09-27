@@ -204,6 +204,7 @@ function TerminalOutput({ content, session, outputRef, live = false }: { content
 
 type LiveLogUpdate = {
   active: boolean
+  running: boolean
   cycle: number
   phase: string
   attempt: number
@@ -218,15 +219,16 @@ type LiveLogUpdate = {
 
 function LiveLogDrawer({ onClose }: { onClose: () => void }) {
   const [update, setUpdate] = useState<LiveLogUpdate | null>(null)
-  const [status, setStatus] = useState<'connecting' | 'live' | 'idle' | 'error'>('connecting')
+  const [status, setStatus] = useState<'connecting' | 'live' | 'stopped' | 'idle' | 'error'>('connecting')
   const [following, setFollowing] = useState(true)
   const outputRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const source = new EventSource('/api/live-log')
     source.addEventListener('log', (event) => {
-      setUpdate(JSON.parse((event as MessageEvent<string>).data) as LiveLogUpdate)
-      setStatus('live')
+      const next = JSON.parse((event as MessageEvent<string>).data) as LiveLogUpdate
+      setUpdate(next)
+      setStatus(next.running ? 'live' : 'stopped')
     })
     source.addEventListener('idle', () => setStatus('idle'))
     source.addEventListener('stream-error', () => setStatus('error'))
@@ -249,6 +251,7 @@ function LiveLogDrawer({ onClose }: { onClose: () => void }) {
       </header>
       <div className="live-meta">
         <span>{update?.file || 'Waiting for an active role log…'}</span>
+        {status === 'stopped' && <span className="live-stopped">Loop is not running · showing last log</span>}
         {update && <span>{update.compactionCount} context compaction{update.compactionCount === 1 ? '' : 's'}{update.session ? ` · ${tokens(update.session.maxContextTokens)} / ${tokens(update.session.contextLimit)} context${contextPercent(update.session) ? ` (${contextPercent(update.session)})` : ''}` : ''} · {bytes(update.size)} · {date(update.updatedAt)}{update.truncated ? ' · latest 256 KB' : ''}</span>}
       </div>
       <TerminalOutput live outputRef={outputRef} session={update?.session || null} content={update?.content || (status === 'idle' ? 'No active cycle log.' : status === 'error' ? 'Connection interrupted. Reconnecting…' : 'Connecting to active cycle…')} />
@@ -399,7 +402,7 @@ function App() {
     <header className="topbar">
       <div className="brand-mark"><BarChart3 size={20} /></div>
       <div className="brand"><strong>Ralph Observatory</strong><span>{data.project.name}</span></div>
-      <div className="source"><span className={data.active ? 'pulse' : 'dot'} />{data.active ? `Cycle ${data.active.cycle} · ${data.active.phase}` : 'Loop idle'}</div>
+      <div className="source"><span className={!data.active ? 'dot' : data.loopRunning ? 'pulse' : 'dot stopped'} />{data.active ? `${data.loopRunning ? '' : 'Loop stopped · '}Cycle ${data.active.cycle} · ${data.active.phase}` : 'Loop idle'}</div>
       <button className="live-button" onClick={() => setLiveLogOpen(true)} disabled={!data.active}><Radio size={15} />Live log</button>
       <button className="icon-button" title="Refresh data" onClick={() => void load()} disabled={refreshing}><RefreshCw size={17} className={refreshing ? 'spin' : ''} /></button>
     </header>
