@@ -444,3 +444,51 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('matches role logs to OpenCode sessions using started_at metadata when no prompt file exists', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-attempt-meta-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-9-1000')
+  const databasePath = path.join(root, 'opencode.db')
+  await mkdir(cycle, { recursive: true })
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({
+    completed: 8,
+    history: [],
+    active: { directory: cycle, phase: 'worker', attempt: 1 },
+  }))
+  const startedAt = Date.now() - 60_000
+  // No worker-1.md prompt file is written by the harness; only this JSON records the session start.
+  await writeFile(path.join(cycle, 'worker-1.json'), JSON.stringify({ started_at: startedAt }))
+  await writeFile(path.join(cycle, 'worker-1.log'), 'worker output')
+
+  const database = new DatabaseSync(databasePath)
+  database.exec(`
+    CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, model TEXT, time_created INTEGER, time_updated INTEGER, parent_id TEXT, title TEXT);
+    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+    CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+  `)
+  database.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)').run('session-meta', root, '{}', startedAt + 500, startedAt + 500, null, 'Worker')
+  database.close()
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  process.env.OPENCODE_DB_PATH = databasePath
+  const { app } = await import(`./index.ts?attempt-meta=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as { cycles: Array<{ artifacts: Array<{ name: string; session: { model: string } | null }> }> }
+    assert.equal(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.session?.model, 'unknown')
+
+    const telemetryResponse = await fetch(`http://127.0.0.1:${address.port}/api/artifact-telemetry?cycle=cycle-9-1000&file=worker-1.log`)
+    assert.equal(telemetryResponse.status, 200)
+    const telemetry = await telemetryResponse.json() as { model: string } | null
+    assert.equal(telemetry?.model, 'unknown')
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})

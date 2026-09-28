@@ -275,9 +275,20 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
   }
 }
 
-function matchingSession(prompt: Artifact | undefined, sessions: OpenCodeSession[]): OpenCodeSession | null {
-  if (!prompt) return null
-  const promptTime = Date.parse(prompt.modifiedAt)
+// Attempts record their session start time in <role>-<attempt>.json ({ started_at }).
+// Older cycles predate that file, so fall back to the prompt file's mtime when it's missing.
+async function attemptStartTime(directory: string, logName: string, promptArtifact: Artifact | undefined): Promise<number | null> {
+  const match = attemptPattern.exec(logName)
+  if (match) {
+    const meta = await readJson(path.join(directory, `${match[1]}-${match[2]}.json`))
+    const startedAt = Number(meta?.started_at)
+    if (Number.isFinite(startedAt) && startedAt > 0) return startedAt
+  }
+  return promptArtifact ? Date.parse(promptArtifact.modifiedAt) : null
+}
+
+function matchingSession(promptTime: number | null, sessions: OpenCodeSession[]): OpenCodeSession | null {
+  if (promptTime === null || Number.isNaN(promptTime)) return null
   const candidates = sessions
     .filter((session) => session.parentId === null)
     .map((session) => ({ session, distance: Math.abs(session.createdAt - promptTime) }))
@@ -390,7 +401,8 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
   const matchedSessions = new Map<string, OpenCodeSession>()
   for (const artifact of artifacts.filter((item) => item.name.endsWith('.log'))) {
     const prompt = artifacts.find((item) => item.name === artifact.name.replace(/\.log$/, '.md'))
-    const session = matchingSession(prompt, sessions)
+    const promptTime = await attemptStartTime(directory, artifact.name, prompt)
+    const session = matchingSession(promptTime, sessions)
     artifact.session = session ? sessionSummary(session) : null
     if (session) {
       artifact.compactionCount = Math.max(artifact.compactionCount, session.compactionCount)
@@ -652,10 +664,13 @@ app.get('/api/artifact-telemetry', async (request, response, next) => {
     const directory = path.join(runtimeRoot, cycle)
     await stat(path.join(directory, file))
     const promptName = file.replace(/\.log$/, '.md')
-    const promptDetails = await stat(path.join(directory, promptName))
-    const prompt: Artifact = { name: promptName, size: promptDetails.size, modifiedAt: promptDetails.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }
+    const promptPath = path.join(directory, promptName)
+    const prompt: Artifact | undefined = existsSync(promptPath)
+      ? await stat(promptPath).then((details) => ({ name: promptName, size: details.size, modifiedAt: details.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }))
+      : undefined
+    const promptTime = await attemptStartTime(directory, file, prompt)
     const sessions = await loadOpenCodeSessions()
-    const session = matchingSession(prompt, sessions)
+    const session = matchingSession(promptTime, sessions)
     response.json(session ? sessionTelemetry(session, sessions) : null)
   } catch (error) { next(error) }
 })
@@ -703,8 +718,9 @@ app.get('/api/live-log', async (request, response) => {
       const promptArtifact: Artifact | undefined = promptDetails
         ? { name: promptName, size: promptDetails.size, modifiedAt: promptDetails.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }
         : undefined
+      const promptTime = await attemptStartTime(activeLog.directory, activeLog.file, promptArtifact)
       const sessions = await loadOpenCodeSessions()
-      const session = matchingSession(promptArtifact, sessions)
+      const session = matchingSession(promptTime, sessions)
       const payload = JSON.stringify({
         active: true,
         running: await loopRunning(),
