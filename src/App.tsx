@@ -181,7 +181,7 @@ function TerminalOutput({ content, session, outputRef, live = false }: { content
   return <div className="terminal-output" ref={outputRef}>
     {events.length || subagents.length ? <div className="session-timeline">{events.map((event) => {
       if (event.type === 'reasoning') {
-        return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="reasoning-block"><summary><BrainCircuit size={13} /><span className="summary-label">Thinking</span><span className="summary-preview">{firstLine(event.text)}</span></summary><pre>{event.text}</pre></details></div>
+        return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="reasoning-block" open={live}><summary><BrainCircuit size={13} /><span className="summary-label">Thinking</span><span className="summary-preview">{firstLine(event.text)}</span></summary><pre>{event.text}</pre></details></div>
       }
       if (event.type === 'compaction') {
         return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="compaction-block"><summary><Archive size={13} /><span className="summary-label">Context compacted</span><span className="summary-preview">Summary preserved for continuation</span></summary><pre>{event.text}</pre></details></div>
@@ -196,7 +196,7 @@ function TerminalOutput({ content, session, outputRef, live = false }: { content
           {event.output && <><strong>{event.status === 'error' ? 'Error' : 'Output'}</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(event.output) }} /></>}
         </div>
       </details></div>
-    })}{live && content && <div className="live-pending-output"><strong>Live output</strong><pre dangerouslySetInnerHTML={{ __html: terminalHtml(liveTail(content)) }} /></div>}
+    })}{live && content && <details className="live-pending-output"><summary>Process log</summary><pre dangerouslySetInnerHTML={{ __html: terminalHtml(liveTail(content)) }} /></details>}
       {subagents.map((subagent) => <SubagentOutput subagent={subagent} live={live} key={subagent.id} />)}
     </div> : <pre dangerouslySetInnerHTML={{ __html: terminalHtml(content) }} />}
   </div>
@@ -238,7 +238,7 @@ function LiveLogDrawer({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     if (following && outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight
-  }, [following, update?.content])
+  }, [following, update])
 
   return <div className="drawer-backdrop" onMouseDown={onClose}>
     <aside className="drawer live-drawer" onMouseDown={(event) => event.stopPropagation()}>
