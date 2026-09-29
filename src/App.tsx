@@ -181,7 +181,7 @@ function TerminalOutput({ content, session, outputRef, live = false }: { content
   return <div className="terminal-output" ref={outputRef}>
     {events.length || subagents.length ? <div className="session-timeline">{events.map((event) => {
       if (event.type === 'reasoning') {
-        return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="reasoning-block" open={live}><summary><BrainCircuit size={13} /><span className="summary-label">Thinking</span><span className="summary-preview">{firstLine(event.text)}</span></summary><pre>{event.text}</pre></details></div>
+        return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="reasoning-block"><summary><BrainCircuit size={13} /><span className="summary-label">Thinking</span><span className="summary-preview">{firstLine(event.text)}</span></summary><pre>{event.text}</pre></details></div>
       }
       if (event.type === 'compaction') {
         return <div className="timeline-row" key={event.id}><time dateTime={new Date(event.createdAt).toISOString()}>{eventTime(event.createdAt)}</time><details className="compaction-block"><summary><Archive size={13} /><span className="summary-label">Context compacted</span><span className="summary-preview">Summary preserved for continuation</span></summary><pre>{event.text}</pre></details></div>
@@ -381,8 +381,10 @@ function App() {
   const phaseTrend = measuredCycles.map((cycle) => {
     const values = Object.fromEntries((Object.keys(phaseColors) as PhaseName[]).map((phase) => [phase, cycle.phases[phase].durationMs || 0])) as Record<PhaseName, number>
     const total = values.worker + values.reviewer + values.retrospective
-    return { cycle: `#${cycle.cycle}`, ...Object.fromEntries((Object.keys(values) as PhaseName[]).map((phase) => [phase, total ? Math.round(values[phase] / total * 100) : 0])) }
+    const shares = Object.fromEntries((Object.keys(values) as PhaseName[]).map((phase) => [phase, total ? values[phase] / total : 0])) as Record<PhaseName, number>
+    return { cycle: `#${cycle.cycle}`, ...shares }
   })
+  const hasPhaseTrend = phaseTrend.some((point) => point.worker + point.reviewer + point.retrospective > 0)
   const telemetryData = measuredCycles.map((cycle) => ({
     cycle: `#${cycle.cycle}`,
     firstContent: cycle.timeBreakdown.firstContentMs / 60000,
@@ -444,10 +446,10 @@ function App() {
 
         <article className="chart-panel wide">
           <div className="panel-title"><div><h3>Workflow share over time</h3><p>Percent of measured role time per cycle</p></div></div>
-          <ResponsiveContainer width="100%" height={260}><AreaChart data={phaseTrend} margin={{ top: 12, right: 18, left: -16, bottom: 0 }} stackOffset="expand">
-            <CartesianGrid stroke="#d8d9d2" vertical={false} strokeDasharray="2 4" /><XAxis dataKey="cycle" tickLine={false} axisLine={false} /><YAxis tickFormatter={(value) => `${Math.round(value * 100)}%`} tickLine={false} axisLine={false} /><Tooltip formatter={(value) => [`${Number(value).toFixed(0)}%`]} /><Legend iconType="square" />
+          {hasPhaseTrend ? <ResponsiveContainer width="100%" height={260}><AreaChart data={phaseTrend} margin={{ top: 12, right: 18, left: -16, bottom: 0 }}>
+            <CartesianGrid stroke="#d8d9d2" vertical={false} strokeDasharray="2 4" /><XAxis dataKey="cycle" tickLine={false} axisLine={false} /><YAxis domain={[0, 1]} tickFormatter={(value) => `${Math.round(value * 100)}%`} tickLine={false} axisLine={false} /><Tooltip formatter={(value) => [`${(Number(value) * 100).toFixed(0)}%`]} /><Legend iconType="square" />
             {(Object.keys(phaseColors) as PhaseName[]).map((phase) => <Area key={phase} type="monotone" dataKey={phase} stackId="share" stroke={phaseColors[phase]} fill={phaseColors[phase]} fillOpacity={0.82} />)}
-          </AreaChart></ResponsiveContainer>
+          </AreaChart></ResponsiveContainer> : <EmptyChart />}
         </article>
 
         <article className="chart-panel phase-summary">

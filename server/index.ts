@@ -423,20 +423,22 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
   const legacyComplete = Boolean(!accepted && !retrospective && result && review?.decision === 'accept' && completedRecord)
   const isComplete = Boolean(accepted || retrospective || legacyComplete)
 
+  const rolePromptNames = { worker: 'brief.md', reviewer: 'review.md', retrospective: 'retrospective.md' } as const
   const phaseTimings = {} as Cycle['phases']
   for (const role of ['worker', 'reviewer', 'retrospective'] as const) {
-    const prompts = artifacts.filter((artifact) => artifact.name.match(attemptPattern)?.[1] === role && artifact.name.endsWith('.md'))
+    const logs = artifacts.filter((artifact) => artifact.name.match(attemptPattern)?.[1] === role && artifact.name.endsWith('.log'))
     let durationMs = 0
     let measured = 0
-    for (const prompt of prompts) {
-      const attempt = prompt.name.match(attemptPattern)?.[2]
-      const log = artifacts.find((artifact) => artifact.name === `${role}-${attempt}.log`)
-      if (log) {
-        durationMs += Math.max(0, Date.parse(log.modifiedAt) - Date.parse(prompt.modifiedAt))
+    for (const log of logs) {
+      const prompt = artifacts.find((artifact) => artifact.name === log.name.replace(/\.log$/, '.md'))
+        || artifacts.find((artifact) => artifact.name === rolePromptNames[role])
+      const startedMs = await attemptStartTime(directory, log.name, prompt)
+      if (startedMs !== null) {
+        durationMs += Math.max(0, Date.parse(log.modifiedAt) - startedMs)
         measured += 1
       }
     }
-    phaseTimings[role] = { durationMs: measured ? durationMs : null, attempts: prompts.length }
+    phaseTimings[role] = { durationMs: measured ? durationMs : null, attempts: logs.length }
   }
 
   const endCandidates = artifacts

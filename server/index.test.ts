@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import os from 'node:os'
@@ -346,6 +346,50 @@ test('reports context compactions per role log and cycle', async () => {
     assert.equal(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.compactionCount, 2)
     assert.equal(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'reviewer-1.log')?.compactionCount, 0)
     assert.equal(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'retrospective-1.log')?.compactionCount, 1)
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('measures workflow phases from current role prompt filenames', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-phase-timing-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-3-1000')
+  await mkdir(cycle, { recursive: true })
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({ completed: 3, history: [] }))
+  await writeFile(path.join(cycle, 'context.json'), JSON.stringify({ cycle: 3, focus: 'workflow' }))
+  await writeFile(path.join(cycle, 'accepted.json'), JSON.stringify({ cycle: 3, outcome: 'change' }))
+
+  const timestamps = {
+    'brief.md': 2_000, 'worker-1.log': 8_000,
+    'review.md': 9_000, 'reviewer-1.log': 12_000,
+    'retrospective.md': 13_000, 'retrospective-1.log': 14_000,
+  }
+  for (const [name, timestamp] of Object.entries(timestamps)) {
+    await writeFile(path.join(cycle, name), name)
+    await utimes(path.join(cycle, name), timestamp / 1000, timestamp / 1000)
+  }
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?phase-timing=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as {
+        metrics: { phaseShare: Record<string, number> }
+        cycles: Array<{ phases: Record<string, { durationMs: number | null; attempts: number }> }>
+      }
+    assert.deepEqual(dashboard.cycles[0].phases, {
+      worker: { durationMs: 6_000, attempts: 1 },
+      reviewer: { durationMs: 3_000, attempts: 1 },
+      retrospective: { durationMs: 1_000, attempts: 1 },
+    })
+    assert.deepEqual(dashboard.metrics.phaseShare, { worker: 0.6, reviewer: 0.3, retrospective: 0.1 })
   } finally {
     server.close()
     await rm(root, { recursive: true, force: true })
