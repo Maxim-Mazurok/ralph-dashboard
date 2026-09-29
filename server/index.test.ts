@@ -320,6 +320,52 @@ test('streams OpenCode tool updates when the role log is unchanged', async () =>
   }
 })
 
+test('uses Ralph attempt events for dashboard and artifact telemetry without SQLite', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-v2-events-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-96-1000')
+  await mkdir(cycle, { recursive: true })
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({ completed: 96, history: [] }))
+  await writeFile(path.join(cycle, 'context.json'), JSON.stringify({ cycle: 96, focus: 'process' }))
+  await writeFile(path.join(cycle, 'accepted.json'), JSON.stringify({ cycle: 96, outcome: 'change' }))
+  await writeFile(path.join(cycle, 'worker-1.log'), 'Done\n')
+  await writeFile(path.join(cycle, 'worker-1.json'), JSON.stringify({
+    started_at: 1000,
+    session_id: 'ses_v2_artifact',
+    selected_model: 'llamacpp/qwen3.8-flash-next-iq3_xxs',
+  }))
+  await writeFile(path.join(cycle, 'worker-1.events.jsonl'), [
+    { type: 'step_start', timestamp: 1000, sessionID: 'ses_v2_artifact', part: { id: 'start', type: 'step-start' } },
+    { type: 'text', timestamp: 1400, sessionID: 'ses_v2_artifact', part: { id: 'text', type: 'text', text: 'Done', time: { start: 1300, end: 1400 } } },
+    { type: 'step_finish', timestamp: 1500, sessionID: 'ses_v2_artifact', part: { id: 'finish', type: 'step-finish', tokens: { total: 123, reasoning: 0 } } },
+  ].map((record) => JSON.stringify(record)).join('\n'))
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  process.env.OPENCODE_DB_PATH = path.join(root, 'missing.db')
+  process.env.OPENCODE_CONFIG_PATH = path.join(root, 'missing.jsonc')
+  const { app } = await import(`./index.ts?v2-events=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as { cycles: Array<{ maxContextTokens: number; timeBreakdown: { inferenceMs: number }; artifacts: Array<{ name: string; session: { model: string } | null }> }> }
+    assert.equal(dashboard.cycles[0].maxContextTokens, 123)
+    assert.equal(dashboard.cycles[0].timeBreakdown.inferenceMs, 500)
+    assert.equal(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.session?.model, 'qwen3.8-flash-next-iq3_xxs')
+
+    const telemetry = await fetch(`http://127.0.0.1:${address.port}/api/artifact-telemetry?cycle=cycle-96-1000&file=worker-1.log`)
+      .then((response) => response.json()) as { events: Array<{ type: string; text: string }>; maxContextTokens: number }
+    assert.equal(telemetry.maxContextTokens, 123)
+    assert.deepEqual(telemetry.events.map((event) => [event.type, event.text]), [['text', 'Done']])
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('reports context compactions per role log and cycle', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-compactions-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-3-1000')

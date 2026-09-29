@@ -6,6 +6,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { promisify } from 'node:util'
+import {
+  parseOpenCodeEvents,
+  type OpenCodeSession,
+  type ReasoningPart,
+  type SessionEvent,
+  type SessionSummary,
+  type TimeBreakdown,
+} from './opencode-events.js'
 
 const app = express()
 const port = Number(process.env.PORT || 4310)
@@ -19,26 +27,10 @@ const textExtensions = new Set(['.json', '.jsonl', '.log', '.md', '.txt'])
 const liveLogLimit = 256 * 1024
 const sessionStartToleranceMs = 10_000
 const openCodeDatabase = process.env.OPENCODE_DB_PATH || path.join(os.homedir(), '.local/share/opencode/opencode.db')
-const openCodeConfig = process.env.OPENCODE_CONFIG_PATH || path.join(os.homedir(), '.config/opencode/opencode.jsonc')
+const openCodeConfig = process.env.OPENCODE_CONFIG_PATH || path.join(os.homedir(), '.local/share/ralph/opencode-v2/xdg/config/opencode/opencode.jsonc')
 const execFileAsync = promisify(execFile)
 
 type JsonObject = Record<string, unknown>
-type TimeBreakdown = { inferenceMs: number; toolMs: number; delegatedMs: number; firstContentMs: number; reasoningMs: number; outputMs: number; toolOutputMs: number; otherInferenceMs: number }
-type SessionSummary = TimeBreakdown & { model: string; maxContextTokens: number; contextLimit: number | null; reasoningTokens: number; reasoningCount: number; compactionCount: number }
-type ReasoningPart = { text: string; startedAt: number | null; endedAt: number | null }
-type SessionEvent = {
-  id: string
-  type: 'reasoning' | 'text' | 'tool' | 'compaction'
-  createdAt: number
-  text?: string
-  tool?: string
-  status?: string
-  title?: string
-  input?: unknown
-  output?: string
-  diff?: string
-}
-type OpenCodeSession = SessionSummary & { id: string; parentId: string | null; title: string; createdAt: number; updatedAt: number; reasoning: ReasoningPart[]; events: SessionEvent[] }
 type Interval = { start: number; end: number }
 
 function mergedIntervals(intervals: Interval[]): Interval[] {
@@ -289,6 +281,29 @@ async function attemptStartTime(directory: string, logName: string, promptArtifa
   return promptArtifact ? Date.parse(promptArtifact.modifiedAt) : null
 }
 
+async function attemptEventSession(directory: string, logName: string, config: JsonObject | null): Promise<OpenCodeSession | null> {
+  const match = attemptPattern.exec(logName)
+  if (!match || match[3] !== 'log') return null
+  const eventsPath = path.join(directory, `${match[1]}-${match[2]}.events.jsonl`)
+  if (!existsSync(eventsPath)) return null
+  const metadata = await readJson(path.join(directory, `${match[1]}-${match[2]}.json`)) || {}
+  const selectedModel = text(metadata.selected_model)
+  const separator = selectedModel.indexOf('/')
+  const providerId = separator > 0 ? selectedModel.slice(0, separator) : ''
+  const modelId = separator > 0 ? selectedModel.slice(separator + 1) : selectedModel
+  try {
+    return parseOpenCodeEvents(
+      await readFile(eventsPath, 'utf8'),
+      metadata,
+      `${match[1]}-${match[2]}`,
+      modelContextLimit(config, providerId, modelId),
+    )
+  } catch (error) {
+    console.warn(`Unable to read OpenCode event telemetry from ${path.basename(eventsPath)}: ${error instanceof Error ? error.message : error}`)
+    return null
+  }
+}
+
 function matchingSession(promptTime: number | null, sessions: OpenCodeSession[]): OpenCodeSession | null {
   if (promptTime === null || Number.isNaN(promptTime)) return null
   const candidates = sessions
@@ -380,7 +395,7 @@ async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null
   }
 }
 
-async function loadCycle(entryName: string, activeDirectory: string | null, sessions: OpenCodeSession[], completedRecord: JsonObject | undefined): Promise<Cycle | null> {
+async function loadCycle(entryName: string, activeDirectory: string | null, sessions: OpenCodeSession[], completedRecord: JsonObject | undefined, config: JsonObject | null): Promise<Cycle | null> {
   const match = cyclePattern.exec(entryName)
   if (!match) return null
 
@@ -402,9 +417,10 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
   artifacts.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
   const matchedSessions = new Map<string, OpenCodeSession>()
   for (const artifact of artifacts.filter((item) => item.name.endsWith('.log'))) {
+    const eventSession = await attemptEventSession(directory, artifact.name, config)
     const prompt = artifacts.find((item) => item.name === artifact.name.replace(/\.log$/, '.md'))
-    const promptTime = await attemptStartTime(directory, artifact.name, prompt)
-    const session = matchingSession(promptTime, sessions)
+    const promptTime = eventSession ? null : await attemptStartTime(directory, artifact.name, prompt)
+    const session = eventSession || matchingSession(promptTime, sessions)
     artifact.session = session ? sessionSummary(session) : null
     if (session) {
       artifact.compactionCount = Math.max(artifact.compactionCount, session.compactionCount)
@@ -526,7 +542,7 @@ function canonicalCycles(cycles: Cycle[]): Cycle[] {
 }
 
 async function loadDashboard() {
-  const sessions = await loadOpenCodeSessions(true)
+  const [sessions, config] = await Promise.all([loadOpenCodeSessions(true), readJson(openCodeConfig)])
   const state = await readJson(path.join(runtimeRoot, 'state.json'))
   const active = state?.active as JsonObject | undefined
   const pendingRetrospective = state?.pendingRetrospective as JsonObject | undefined
@@ -550,7 +566,7 @@ async function loadDashboard() {
     for (const entry of Array.isArray(context?.recent_outcomes) ? context.recent_outcomes : []) rememberCompleted(entry)
   }
   const cycleDirectories = (await Promise.all(cycleEntries
-    .map((entry) => loadCycle(entry.name, activeDirectory, sessions, completedRecords.get(path.join(runtimeRoot, entry.name))))))
+    .map((entry) => loadCycle(entry.name, activeDirectory, sessions, completedRecords.get(path.join(runtimeRoot, entry.name)), config))))
     .filter((cycle): cycle is Cycle => cycle !== null)
     .sort((a, b) => a.cycle - b.cycle || a.startedAt.localeCompare(b.startedAt))
   const cycles = canonicalCycles(cycleDirectories)
@@ -691,6 +707,8 @@ app.get('/api/artifact-telemetry', async (request, response, next) => {
     const prompt: Artifact | undefined = existsSync(promptPath)
       ? await stat(promptPath).then((details) => ({ name: promptName, size: details.size, modifiedAt: details.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }))
       : undefined
+    const eventSession = await attemptEventSession(directory, file, await readJson(openCodeConfig))
+    if (eventSession) return response.json(sessionTelemetry(eventSession, [eventSession]))
     const promptTime = await attemptStartTime(directory, file, prompt)
     const sessions = await loadOpenCodeSessions()
     const session = matchingSession(promptTime, sessions)
@@ -741,9 +759,10 @@ app.get('/api/live-log', async (request, response) => {
       const promptArtifact: Artifact | undefined = promptDetails
         ? { name: promptName, size: promptDetails.size, modifiedAt: promptDetails.mtime.toISOString(), kind: 'md', compactionCount: 0, session: null }
         : undefined
-      const promptTime = await attemptStartTime(activeLog.directory, activeLog.file, promptArtifact)
-      const sessions = await loadOpenCodeSessions()
-      const session = matchingSession(promptTime, sessions)
+      const eventSession = await attemptEventSession(activeLog.directory, activeLog.file, await readJson(openCodeConfig))
+      const promptTime = eventSession ? null : await attemptStartTime(activeLog.directory, activeLog.file, promptArtifact)
+      const sessions = eventSession ? [eventSession] : await loadOpenCodeSessions()
+      const session = eventSession || matchingSession(promptTime, sessions)
       const payload = JSON.stringify({
         active: true,
         running: await loopRunning(),

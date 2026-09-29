@@ -44,6 +44,8 @@ The default observed project is `/home/user/home-inventory`. Point the API at an
 RALPH_PROJECT_PATH=/path/to/project npm run dev
 ```
 
+The API reads model limits from the isolated Ralph v2 profile by default. Set `OPENCODE_CONFIG_PATH` to use another OpenCode config; `OPENCODE_DB_PATH` controls the legacy SQLite fallback for historical cycles.
+
 For a production-style local run:
 
 ```bash
@@ -63,6 +65,7 @@ When running inside WSL2 in NAT mode, `0.0.0.0` binds inside the Linux VM. Other
 ## Metrics
 
 - Cycle outcomes and focus come from cycle `context.json`, `result.json`, and `accepted.json` files.
+- OpenCode v2 timing, tokens, tools, compactions, and live output come from Ralph-owned `{role}-{attempt}.events.jsonl` sidecars. Historical cycles without sidecars fall back to the legacy OpenCode SQLite store.
 - Completed cycles have an `accepted.json` or `retrospective.json` file. For cycles from before those files existed, a matching completion record in a later cycle's `context.json` or current `state.json` history is accepted when `result.json` and an accepting `review.json` are present.
 - Cycle elapsed time runs from the millisecond timestamp in the cycle directory name to the latest completion artifact.
 - Worker, reviewer, and retrospective time is inferred from each attempt prompt's modification time through its log's modification time.
