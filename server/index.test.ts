@@ -324,7 +324,11 @@ test('uses Ralph attempt events for dashboard and artifact telemetry without SQL
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-v2-events-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-96-1000')
   await mkdir(cycle, { recursive: true })
-  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({ completed: 96, history: [] }))
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({
+    completed: 95,
+    history: [],
+    active: { directory: cycle, phase: 'worker', attempt: 1, cycle: 96 },
+  }))
   await writeFile(path.join(cycle, 'context.json'), JSON.stringify({ cycle: 96, focus: 'process' }))
   await writeFile(path.join(cycle, 'accepted.json'), JSON.stringify({ cycle: 96, outcome: 'change' }))
   await writeFile(path.join(cycle, 'worker-1.log'), 'Done\n')
@@ -335,6 +339,7 @@ test('uses Ralph attempt events for dashboard and artifact telemetry without SQL
   }))
   await writeFile(path.join(cycle, 'worker-1.events.jsonl'), [
     { type: 'step_start', timestamp: 1000, sessionID: 'ses_v2_artifact', part: { id: 'start', type: 'step-start' } },
+    { type: 'reasoning', timestamp: 1200, sessionID: 'ses_v2_artifact', part: { id: 'reason', type: 'reasoning', text: 'Visible live thought', time: { start: 1100, end: 1200 } } },
     { type: 'text', timestamp: 1400, sessionID: 'ses_v2_artifact', part: { id: 'text', type: 'text', text: 'Done', time: { start: 1300, end: 1400 } } },
     { type: 'step_finish', timestamp: 1500, sessionID: 'ses_v2_artifact', part: { id: 'finish', type: 'step-finish', tokens: { total: 123, reasoning: 0 } } },
   ].map((record) => JSON.stringify(record)).join('\n'))
@@ -359,7 +364,20 @@ test('uses Ralph attempt events for dashboard and artifact telemetry without SQL
     const telemetry = await fetch(`http://127.0.0.1:${address.port}/api/artifact-telemetry?cycle=cycle-96-1000&file=worker-1.log`)
       .then((response) => response.json()) as { events: Array<{ type: string; text: string }>; maxContextTokens: number }
     assert.equal(telemetry.maxContextTokens, 123)
-    assert.deepEqual(telemetry.events.map((event) => [event.type, event.text]), [['text', 'Done']])
+    assert.deepEqual(telemetry.events.map((event) => [event.type, event.text]), [
+      ['reasoning', 'Visible live thought'],
+      ['text', 'Done'],
+    ])
+
+    const controller = new AbortController()
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/live-log`, { signal: controller.signal })
+    const frame = new TextDecoder().decode((await response.body!.getReader().read()).value)
+    controller.abort()
+    const payload = JSON.parse(frame.match(/^data: (.+)$/m)?.[1] || '{}') as { session: { events: Array<{ type: string; text: string }> } }
+    assert.deepEqual(payload.session.events.map((event) => [event.type, event.text]), [
+      ['reasoning', 'Visible live thought'],
+      ['text', 'Done'],
+    ])
   } finally {
     server.close()
     await rm(root, { recursive: true, force: true })
