@@ -14,7 +14,7 @@ main { max-width: 1500px; margin: 0 auto; padding: 34px 34px 50px; }
 h1,h2,h3,h4,p { margin-top: 0; } h1 { margin-bottom: 6px; font-size: 34px; line-height: 1.05; letter-spacing: 0; } h2 { margin-bottom: 4px; font-size: 20px; } h3 { margin: 0; font-size: 15px; } h4 { margin-bottom: 0; }
 .page-heading>div>p:last-child,.section-bar p,.panel-title p { margin: 0; color: var(--muted); font-size: 13px; }
 .path-label { max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 7px 10px; color: #586461; background: #e7e6de; border: 1px solid var(--line); border-radius: 3px; font: 11px 'DM Mono', monospace; }
-.metrics-grid { display: grid; grid-template-columns: repeat(4,1fr); border: 1px solid var(--line); background: var(--line); gap: 1px; }
+.metrics-grid { display: grid; grid-template-columns: repeat(5,1fr); border: 1px solid var(--line); background: var(--line); gap: 1px; }
 .metric { padding: 18px 20px; min-width: 0; background: #fff; }.metric-label { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }.metric>strong { display: block; margin: 8px 0 2px; font: 500 28px 'DM Mono', monospace; }.metric>span { display: block; overflow: hidden; color: #7a8280; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .section-bar { padding: 32px 0 13px; display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 1px solid var(--ink); }
 .segmented { display: inline-flex; padding: 2px; background: #dfded7; border-radius: 4px; }.segmented button { min-width: 42px; padding: 5px 9px; border: 0; border-radius: 3px; color: #65706d; background: transparent; font-size: 11px; cursor: pointer; }.segmented button.active { color: #fff; background: var(--blue); }

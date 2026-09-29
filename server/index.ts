@@ -85,6 +85,8 @@ type Cycle = {
   commit: string | null
   durationMs: number | null
   retryCount: number
+  reviewIterationCount: number
+  unexpectedRetryCount: number
   compactionCount: number
   maxContextTokens: number | null
   contextLimit: number | null
@@ -445,8 +447,23 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
     .filter((artifact) => /^(accepted|retrospective)\.json$/.test(artifact.name) || /-(\d+)\.log$/.test(artifact.name))
     .map((artifact) => Date.parse(artifact.modifiedAt))
   const endedMs = isComplete && endCandidates.length ? Math.max(...endCandidates) : null
-  const retryCount = Object.values(phaseTimings).reduce((total, phase) => total + Math.max(0, phase.attempts - 1), 0)
-    + artifacts.filter((artifact) => artifact.name.includes('feedback')).length
+  const attemptsFor = (role: string) => new Set(artifacts.flatMap((artifact) => {
+    const attempt = attemptPattern.exec(artifact.name)
+    return attempt?.[1] === role ? [Number(attempt[2])] : []
+  }))
+  const workerAttempts = attemptsFor('worker')
+  const reviewerAttempts = attemptsFor('reviewer')
+  const retrospectiveAttempts = attemptsFor('retrospective')
+  const maxWorkflowAttempt = Math.max(1, ...workerAttempts, ...reviewerAttempts)
+  let reviewIterationCount = 0
+  let unexpectedRetryCount = Math.max(0, Math.max(1, ...retrospectiveAttempts) - 1)
+  for (let attempt = 2; attempt <= maxWorkflowAttempt; attempt++) {
+    // Only a revise verdict moves the phase from reviewer back to worker before the shared
+    // attempt number advances. All other transitions are operational failures or invalid output.
+    if (reviewerAttempts.has(attempt - 1) && workerAttempts.has(attempt)) reviewIterationCount++
+    else unexpectedRetryCount++
+  }
+  const retryCount = reviewIterationCount + unexpectedRetryCount
   const peakSession = artifacts.reduce<SessionSummary | null>((peak, artifact) => artifact.session && (!peak || artifact.session.maxContextTokens > peak.maxContextTokens) ? artifact.session : peak, null)
   const timeBreakdown = [...matchedSessions.values()].reduce<TimeBreakdown>((total, session) => ({
     inferenceMs: total.inferenceMs + session.inferenceMs,
@@ -472,6 +489,8 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
     commit: text(accepted?.commit, legacyComplete ? text(completedRecord?.commit) : '') || null,
     durationMs: endedMs ? Math.max(0, endedMs - startedMs) : null,
     retryCount,
+    reviewIterationCount,
+    unexpectedRetryCount,
     compactionCount: artifacts.reduce((total, artifact) => total + artifact.compactionCount, 0),
     maxContextTokens: peakSession?.maxContextTokens ?? null,
     contextLimit: peakSession?.contextLimit ?? null,
@@ -563,6 +582,8 @@ async function loadDashboard() {
       totalCycles: cycles.length,
       completedCycles: complete.length,
       retryRate: cycles.length ? cycles.filter((cycle) => cycle.retryCount > 0).length / cycles.length : 0,
+      reviewIterationRate: cycles.length ? cycles.filter((cycle) => cycle.reviewIterationCount > 0).length / cycles.length : 0,
+      unexpectedRetryRate: cycles.length ? cycles.filter((cycle) => cycle.unexpectedRetryCount > 0).length / cycles.length : 0,
       changeRate: complete.length ? changedCycles / complete.length : 0,
       changedCycles,
       medianCycleMs: quantile(durations, 0.5),

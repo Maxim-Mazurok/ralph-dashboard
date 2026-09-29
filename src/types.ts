@@ -65,6 +65,8 @@ export type Cycle = {
   commit: string | null
   durationMs: number | null
   retryCount: number
+  reviewIterationCount: number
+  unexpectedRetryCount: number
   compactionCount: number
   maxContextTokens: number | null
   contextLimit: number | null
@@ -92,6 +94,8 @@ export type DashboardData = {
     totalCycles: number
     completedCycles: number
     retryRate: number
+    reviewIterationRate: number
+    unexpectedRetryRate: number
     changeRate: number
     changedCycles: number
     medianCycleMs: number | null

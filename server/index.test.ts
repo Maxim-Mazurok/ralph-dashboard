@@ -396,6 +396,53 @@ test('measures workflow phases from current role prompt filenames', async () => 
   }
 })
 
+test('separates review iterations from unexpected retries', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-retries-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-95-1000')
+  const workerFailure = path.join(root, '.ralph/runtime/cycle-96-2000')
+  const reviewerFailure = path.join(root, '.ralph/runtime/cycle-97-3000')
+  await Promise.all([cycle, workerFailure, reviewerFailure].map((directory) => mkdir(directory, { recursive: true })))
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({ completed: 97, history: [] }))
+  await writeFile(path.join(cycle, 'context.json'), JSON.stringify({ cycle: 95, focus: 'architecture' }))
+  await writeFile(path.join(cycle, 'accepted.json'), JSON.stringify({ cycle: 95, outcome: 'change' }))
+  await Promise.all([
+    'worker-1.log', 'reviewer-1.log', 'worker-2.log', 'reviewer-2.log',
+    'retrospective-1.log', 'retrospective-2.log', 'feedback.md', 'retrospective-feedback.md',
+  ].map((name) => writeFile(path.join(cycle, name), name)))
+  await writeFile(path.join(workerFailure, 'context.json'), JSON.stringify({ cycle: 96, focus: 'workflow' }))
+  await writeFile(path.join(workerFailure, 'accepted.json'), JSON.stringify({ cycle: 96, outcome: 'change' }))
+  await Promise.all(['worker-1.log', 'worker-2.log', 'reviewer-2.log'].map((name) => writeFile(path.join(workerFailure, name), name)))
+  await writeFile(path.join(reviewerFailure, 'context.json'), JSON.stringify({ cycle: 97, focus: 'workflow' }))
+  await writeFile(path.join(reviewerFailure, 'accepted.json'), JSON.stringify({ cycle: 97, outcome: 'change' }))
+  await Promise.all(['worker-1.log', 'reviewer-1.log', 'reviewer-2.log'].map((name) => writeFile(path.join(reviewerFailure, name), name)))
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?retries=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as {
+        metrics: { reviewIterationRate: number; unexpectedRetryRate: number }
+        cycles: Array<{ retryCount: number; reviewIterationCount: number; unexpectedRetryCount: number }>
+      }
+    assert.deepEqual(dashboard.cycles.map(({ retryCount, reviewIterationCount, unexpectedRetryCount }) => ({ retryCount, reviewIterationCount, unexpectedRetryCount })), [
+      { retryCount: 2, reviewIterationCount: 1, unexpectedRetryCount: 1 },
+      { retryCount: 1, reviewIterationCount: 0, unexpectedRetryCount: 1 },
+      { retryCount: 1, reviewIterationCount: 0, unexpectedRetryCount: 1 },
+    ])
+    assert.equal(dashboard.metrics.reviewIterationRate, 1 / 3)
+    assert.equal(dashboard.metrics.unexpectedRetryRate, 1)
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('matches role logs to OpenCode sessions and reports peak context and reasoning', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-context-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-4-1000')
