@@ -460,6 +460,42 @@ test('measures workflow phases from current role prompt filenames', async () => 
   }
 })
 
+test('excludes idle gaps between stopped and resumed attempts from cycle duration', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-active-duration-'))
+  const cycle = path.join(root, '.ralph/runtime/cycle-3-1000')
+  await mkdir(cycle, { recursive: true })
+  await writeFile(path.join(root, '.ralph/runtime/state.json'), JSON.stringify({ completed: 3, history: [] }))
+  await writeFile(path.join(cycle, 'context.json'), JSON.stringify({ cycle: 3, focus: 'workflow' }))
+  await writeFile(path.join(cycle, 'accepted.json'), JSON.stringify({ cycle: 3, outcome: 'change' }))
+  await writeFile(path.join(cycle, 'retrospective.json'), JSON.stringify({ assessment: 'Complete' }))
+  await writeFile(path.join(cycle, 'worker-1.json'), JSON.stringify({ started_at: 2_000 }))
+  await writeFile(path.join(cycle, 'worker-1.log'), 'Done')
+  await writeFile(path.join(cycle, 'retrospective-1.json'), JSON.stringify({ started_at: 100_000 }))
+  await writeFile(path.join(cycle, 'retrospective-1.log'), 'Done')
+  await utimes(path.join(cycle, 'accepted.json'), 9, 9)
+  await utimes(path.join(cycle, 'retrospective.json'), 103, 103)
+  await utimes(path.join(cycle, 'worker-1.log'), 8, 8)
+  await utimes(path.join(cycle, 'retrospective-1.log'), 104, 104)
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?active-duration=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+      .then((response) => response.json()) as { cycles: Array<{ durationMs: number; endedAt: string }> }
+    assert.equal(dashboard.cycles[0].durationMs, 10_000)
+    assert.equal(dashboard.cycles[0].endedAt, new Date(104_000).toISOString())
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('separates review iterations from unexpected retries', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-retries-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-95-1000')

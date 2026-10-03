@@ -67,7 +67,7 @@ When running inside WSL2 in NAT mode, `0.0.0.0` binds inside the Linux VM. Other
 - Cycle outcomes and focus come from cycle `context.json`, `result.json`, and `accepted.json` files.
 - OpenCode v2 timing, tokens, tools, compactions, and live output come from Ralph-owned `{role}-{attempt}.events.jsonl` sidecars. Historical cycles without sidecars fall back to the legacy OpenCode SQLite store.
 - Completed cycles have an `accepted.json` or `retrospective.json` file. For cycles from before those files existed, a matching completion record in a later cycle's `context.json` or current `state.json` history is accepted when `result.json` and an accepting `review.json` are present.
-- Cycle elapsed time runs from the millisecond timestamp in the cycle directory name to the latest completion artifact.
+- Cycle duration sums attempt-active time from Ralph's `started_at` metadata through each attempt log's final write, excluding gaps while a step is stopped. Older cycles without attempt metadata fall back to elapsed time from the cycle directory timestamp to the latest completion artifact.
 - Worker, reviewer, and retrospective time is inferred from each attempt prompt's modification time through its log's modification time.
 - Review iterations count attempts where a reviewer verdict sent the candidate back to a new
 	worker attempt. Operational retries count all other extra attempts, including process,

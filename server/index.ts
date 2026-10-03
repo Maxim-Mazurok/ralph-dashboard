@@ -271,13 +271,17 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
 
 // Attempts record their session start time in <role>-<attempt>.json ({ started_at }).
 // Older cycles predate that file, so fall back to the prompt file's mtime when it's missing.
-async function attemptStartTime(directory: string, logName: string, promptArtifact: Artifact | undefined): Promise<number | null> {
+async function attemptMetadataStartTime(directory: string, logName: string): Promise<number | null> {
   const match = attemptPattern.exec(logName)
-  if (match) {
-    const meta = await readJson(path.join(directory, `${match[1]}-${match[2]}.json`))
-    const startedAt = Number(meta?.started_at)
-    if (Number.isFinite(startedAt) && startedAt > 0) return startedAt
-  }
+  if (!match) return null
+  const meta = await readJson(path.join(directory, `${match[1]}-${match[2]}.json`))
+  const startedAt = Number(meta?.started_at)
+  return Number.isFinite(startedAt) && startedAt > 0 ? startedAt : null
+}
+
+async function attemptStartTime(directory: string, logName: string, promptArtifact: Artifact | undefined): Promise<number | null> {
+  const metadataStart = await attemptMetadataStartTime(directory, logName)
+  if (metadataStart !== null) return metadataStart
   return promptArtifact ? Date.parse(promptArtifact.modifiedAt) : null
 }
 
@@ -443,8 +447,12 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
 
   const rolePromptNames = { worker: 'brief.md', reviewer: 'review.md', retrospective: 'retrospective.md' } as const
   const phaseTimings = {} as Cycle['phases']
+  let activeDurationMs = 0
+  let activeDurationMeasured = 0
+  let attemptCount = 0
   for (const role of ['worker', 'reviewer', 'retrospective'] as const) {
     const logs = artifacts.filter((artifact) => artifact.name.match(attemptPattern)?.[1] === role && artifact.name.endsWith('.log'))
+    attemptCount += logs.length
     let durationMs = 0
     let measured = 0
     for (const log of logs) {
@@ -454,6 +462,11 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
       if (startedMs !== null) {
         durationMs += Math.max(0, Date.parse(log.modifiedAt) - startedMs)
         measured += 1
+      }
+      const metadataStart = await attemptMetadataStartTime(directory, log.name)
+      if (metadataStart !== null) {
+        activeDurationMs += Math.max(0, Date.parse(log.modifiedAt) - metadataStart)
+        activeDurationMeasured += 1
       }
     }
     phaseTimings[role] = { durationMs: measured ? durationMs : null, attempts: logs.length }
@@ -503,7 +516,11 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
     decision: text(review?.decision) || null,
     summary: text(result?.summary, text(accepted?.summary, 'No result recorded yet.')),
     commit: text(accepted?.commit, legacyComplete ? text(completedRecord?.commit) : '') || null,
-    durationMs: endedMs ? Math.max(0, endedMs - startedMs) : null,
+    durationMs: endedMs
+      ? activeDurationMeasured > 0 && activeDurationMeasured === attemptCount
+        ? activeDurationMs
+        : Math.max(0, endedMs - startedMs)
+      : null,
     retryCount,
     reviewIterationCount,
     unexpectedRetryCount,
