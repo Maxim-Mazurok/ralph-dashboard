@@ -2,6 +2,7 @@ export type PhaseName = 'worker' | 'reviewer' | 'retrospective'
 
 export type SessionSummary = {
   model: string
+  activeMs: number
   maxContextTokens: number
   contextLimit: number | null
   reasoningTokens: number

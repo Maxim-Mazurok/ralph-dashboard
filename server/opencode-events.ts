@@ -11,6 +11,7 @@ export type TimeBreakdown = {
 
 export type SessionSummary = TimeBreakdown & {
   model: string
+  activeMs: number
   maxContextTokens: number
   contextLimit: number | null
   reasoningTokens: number
@@ -117,6 +118,7 @@ export function parseOpenCodeEvents(
     createdAt: startedAt,
     updatedAt: timestamps.length ? Math.max(...timestamps) : startedAt,
     model: modelName(metadata),
+    activeMs: 0,
     maxContextTokens: 0,
     contextLimit,
     reasoningTokens: 0,
@@ -138,6 +140,7 @@ export function parseOpenCodeEvents(
   const delegated: Interval[] = []
   const steps: Interval[] = []
   let stepStart: number | null = null
+  let stepLastActivity: number | null = null
   let firstContentSeen = false
 
   for (const record of records) {
@@ -149,18 +152,26 @@ export function parseOpenCodeEvents(
     const start = number(partTime.start)
     const end = number(partTime.end)
     const eventId = string(part.id, `${type}-${timestamp}`)
+    const recordStateTime = object(object(part.state).time)
+    const activityAt = Math.max(timestamp, start || 0, end || 0, number(recordStateTime.start) || 0, number(recordStateTime.end) || 0)
 
     if (type === 'step_start') {
+      if (stepStart !== null && stepLastActivity !== null && stepLastActivity >= stepStart) {
+        steps.push({ start: stepStart, end: stepLastActivity })
+      }
       stepStart = timestamp
+      stepLastActivity = timestamp
       firstContentSeen = false
       continue
     }
+    if (stepStart !== null) stepLastActivity = Math.max(stepLastActivity || stepStart, activityAt)
     if (type === 'step_finish') {
       const tokens = object(part.tokens)
       session.maxContextTokens = Math.max(session.maxContextTokens, Number(tokens.total) || 0)
       session.reasoningTokens += Number(tokens.reasoning) || 0
       if (stepStart !== null && timestamp >= stepStart) steps.push({ start: stepStart, end: timestamp })
       stepStart = null
+      stepLastActivity = null
       continue
     }
     if (type === 'compaction' || partType === 'compaction') {
@@ -213,6 +224,10 @@ export function parseOpenCodeEvents(
     })
   }
 
+  if (stepStart !== null && stepLastActivity !== null && stepLastActivity >= stepStart) {
+    steps.push({ start: stepStart, end: stepLastActivity })
+  }
+  session.activeMs = duration(steps)
   session.toolMs = duration(tools)
   session.delegatedMs = duration(delegated)
   session.inferenceMs = Math.max(0, duration(steps) - duration([...tools, ...delegated]))

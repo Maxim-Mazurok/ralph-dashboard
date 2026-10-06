@@ -143,7 +143,7 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
       sessions.set(String(row.id), {
         id: String(row.id), parentId: row.parent_id ? String(row.parent_id) : null, title: text(row.title, 'Subagent'),
         createdAt: Number(row.time_created), updatedAt: Number(row.time_updated), model: modelId || 'unknown',
-        maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0, compactionCount: 0,
+        activeMs: 0, maxContextTokens: 0, contextLimit: modelContextLimit(config, providerId, modelId), reasoningTokens: 0, reasoningCount: 0, compactionCount: 0,
         inferenceMs: 0, toolMs: 0, delegatedMs: 0, firstContentMs: 0, reasoningMs: 0, outputMs: 0, toolOutputMs: 0, otherInferenceMs: 0, reasoning: [], events: [],
       })
     }
@@ -209,6 +209,7 @@ async function loadOpenCodeSessions(summaryOnly = false): Promise<OpenCodeSessio
       const start = Number(row.started_at)
       const end = Number(row.ended_at)
       if (!start || !Number.isFinite(end) || end < start) continue
+      session.activeMs += end - start
       const excluded = mergedIntervals([...tools, ...tasks].map((item) => ({ start: Math.max(start, item.start), end: Math.min(end, item.end) })).filter((item) => item.end >= item.start))
       const inference = end - start - intervalDuration(excluded)
       session.inferenceMs += inference
@@ -320,8 +321,8 @@ function matchingSession(promptTime: number | null, sessions: OpenCodeSession[])
 }
 
 function sessionSummary(session: OpenCodeSession): SessionSummary {
-  const { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, compactionCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs } = session
-  return { model, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, compactionCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs }
+  const { model, activeMs, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, compactionCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs } = session
+  return { model, activeMs, maxContextTokens, contextLimit, reasoningTokens, reasoningCount, compactionCount, inferenceMs, toolMs, delegatedMs, firstContentMs, reasoningMs, outputMs, toolOutputMs, otherInferenceMs }
 }
 
 function sessionTelemetry(session: OpenCodeSession, sessions: OpenCodeSession[]): SessionTelemetry {
@@ -459,13 +460,14 @@ async function loadCycle(entryName: string, activeDirectory: string | null, sess
       const prompt = artifacts.find((artifact) => artifact.name === log.name.replace(/\.log$/, '.md'))
         || artifacts.find((artifact) => artifact.name === rolePromptNames[role])
       const startedMs = await attemptStartTime(directory, log.name, prompt)
-      if (startedMs !== null) {
-        durationMs += Math.max(0, Date.parse(log.modifiedAt) - startedMs)
+      const measuredActiveMs = log.session?.activeMs && log.session.activeMs > 0 ? log.session.activeMs : null
+      if (measuredActiveMs !== null || startedMs !== null) {
+        durationMs += measuredActiveMs ?? Math.max(0, Date.parse(log.modifiedAt) - (startedMs as number))
         measured += 1
       }
       const metadataStart = await attemptMetadataStartTime(directory, log.name)
       if (metadataStart !== null) {
-        activeDurationMs += Math.max(0, Date.parse(log.modifiedAt) - metadataStart)
+        activeDurationMs += measuredActiveMs ?? Math.max(0, Date.parse(log.modifiedAt) - metadataStart)
         activeDurationMeasured += 1
       }
     }

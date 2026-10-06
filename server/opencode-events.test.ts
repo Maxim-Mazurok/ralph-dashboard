@@ -19,6 +19,7 @@ test('parses the observed OpenCode v2 JSONL contract', () => {
   assert.equal(session.maxContextTokens, 9289)
   assert.equal(session.reasoningTokens, 7)
   assert.equal(session.reasoningCount, 1)
+  assert.equal(session.activeMs, 500)
   assert.equal(session.inferenceMs, 500)
   assert.equal(session.reasoningMs, 100)
   assert.equal(session.outputMs, 100)
@@ -57,4 +58,17 @@ test('maps completed tools, delegated time, compactions, duplicates, and partial
 test('requires a valid session id from metadata or events', () => {
   assert.equal(parseOpenCodeEvents('{"type":"text","part":{"text":"orphan"}}'), null)
   assert.equal(parseOpenCodeEvents('', { session_id: 'ses_metadata' })?.id, 'ses_metadata')
+})
+
+test('excludes gaps between steps and measures an interrupted final step', () => {
+  const session = parseOpenCodeEvents(lines([
+    { type: 'step_start', timestamp: 1000, sessionID: 'ses_interrupted', part: { id: 'start-1' } },
+    { type: 'reasoning', timestamp: 1100, sessionID: 'ses_interrupted', part: { id: 'reason', text: 'Working' } },
+    { type: 'step_finish', timestamp: 1200, sessionID: 'ses_interrupted', part: { id: 'finish-1' } },
+    { type: 'step_start', timestamp: 100_000, sessionID: 'ses_interrupted', part: { id: 'start-2' } },
+    { type: 'text', timestamp: 100_100, sessionID: 'ses_interrupted', part: { id: 'partial', text: 'Interrupted' } },
+  ]), {})
+
+  assert(session)
+  assert.equal(session.activeMs, 300)
 })
