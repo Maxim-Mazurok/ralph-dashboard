@@ -29,6 +29,16 @@ const telemetryColors = {
   tools: '#287271',
   delegated: '#4c7180',
 }
+const telemetryDefinitions = [
+  { key: 'firstContent', label: 'First content', kind: 'estimate', description: 'Cumulative wait from every model-step start to its first reasoning or text part. Includes queueing, prompt prefill, cache behavior, and model stalls.' },
+  { key: 'reasoning', label: 'Reasoning', kind: 'inference', description: 'Time covered by timestamped model reasoning parts.' },
+  { key: 'output', label: 'Output', kind: 'inference', description: 'Time covered by timestamped assistant text parts.' },
+  { key: 'toolOutput', label: 'Tool-call generation', kind: 'estimate', description: 'Untimed gap between the last model content and tool execution. Legacy SQLite cycles may report this; event-sidecar cycles commonly have no positive gap.' },
+  { key: 'otherInference', label: 'Other inference', kind: 'inference', description: 'Remaining model-step time not assigned to first content, reasoning, output, or tool-call output.' },
+  { key: 'tools', label: 'Tool calls', kind: 'execution', description: 'Measured execution time for tools other than delegated subagent tasks.' },
+  { key: 'delegated', label: 'Delegated', kind: 'execution', description: 'Measured execution time for delegated task or subagent calls.' },
+] as const
+type TelemetryKey = typeof telemetryDefinitions[number]['key']
 const outcomeColors: Record<string, string> = {
   change: '#287271', investigation: '#d19a32', no_change: '#87908d',
   incomplete: '#c6483d', active: '#3277a8',
@@ -264,6 +274,7 @@ function App() {
   const [error, setError] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [range, setRange] = useState(12)
+  const [hiddenTelemetry, setHiddenTelemetry] = useState<Set<TelemetryKey>>(() => new Set())
   const [query, setQuery] = useState('')
   const deferredQuery = useDeferredValue(query)
   const [selectedCycleId, setSelectedCycleId] = useState('')
@@ -273,6 +284,15 @@ function App() {
   const [discardingStep, setDiscardingStep] = useState(false)
   const latestCycleId = useRef('')
   const loading = useRef(false)
+
+  function toggleTelemetry(key: TelemetryKey) {
+    setHiddenTelemetry((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
 
   const load = useCallback(async (showRefreshing = true) => {
     if (loading.current) return
@@ -461,29 +481,27 @@ function App() {
 
         <article className="chart-panel wide">
           <div className="panel-title"><div><h3>Model & tool time per cycle</h3><p>OpenCode intervals and estimates, minutes</p></div></div>
+          <div className="telemetry-toggles" aria-label="Visible timing categories">
+            {telemetryDefinitions.map((item) => <button type="button" aria-pressed={!hiddenTelemetry.has(item.key)} className={hiddenTelemetry.has(item.key) ? 'off' : ''} key={item.key} onClick={() => toggleTelemetry(item.key)}>
+              <span className="swatch" style={{ background: telemetryColors[item.key] }} />{item.label}
+            </button>)}
+          </div>
           {hasTelemetry ? <ResponsiveContainer width="100%" height={260}><BarChart data={telemetryData} margin={{ top: 12, right: 18, left: -16, bottom: 0 }}>
             <CartesianGrid stroke="#d8d9d2" vertical={false} strokeDasharray="2 4" /><XAxis dataKey="cycle" tickLine={false} axisLine={false} /><YAxis tickLine={false} axisLine={false} unit="m" />
-            <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)} min`, String(name).replace(/([A-Z])/g, ' $1').toLowerCase()]} /><Legend iconType="square" formatter={(value) => value.replace(/([A-Z])/g, ' $1').toLowerCase()} />
-            <Bar dataKey="firstContent" stackId="time" fill={telemetryColors.firstContent} />
-            <Bar dataKey="reasoning" stackId="time" fill={telemetryColors.reasoning} />
-            <Bar dataKey="output" stackId="time" fill={telemetryColors.output} />
-            <Bar dataKey="toolOutput" stackId="time" fill={telemetryColors.toolOutput} />
-            <Bar dataKey="otherInference" stackId="time" fill={telemetryColors.otherInference} />
-            <Bar dataKey="tools" stackId="time" fill={telemetryColors.tools} />
-            <Bar dataKey="delegated" stackId="time" fill={telemetryColors.delegated} />
+            <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)} min`, telemetryDefinitions.find((item) => item.key === name)?.label || String(name)]} />
+            {telemetryDefinitions.filter((item) => !hiddenTelemetry.has(item.key)).map((item) => <Bar key={item.key} dataKey={item.key} stackId="time" fill={telemetryColors[item.key]} />)}
           </BarChart></ResponsiveContainer> : <EmptyChart />}
         </article>
 
         <article className="chart-panel phase-summary">
           <div className="panel-title"><div><h3>How time is classified</h3><p>OpenCode message, part, and tool timestamps</p></div></div>
-          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.firstContent }} /><span>First content</span><strong>estimate</strong></div>
-          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.reasoning }} /><span>Reasoning</span><strong>inference</strong></div>
-          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.output }} /><span>Output</span><strong>inference</strong></div>
-          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.toolOutput }} /><span>Tool-call output</span><strong>estimate</strong></div>
-          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.otherInference }} /><span>Other inference</span><strong>inference</strong></div>
-          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.tools }} /><span>Tool calls</span><strong>execution</strong></div>
-          <div className="phase-row"><span className="swatch" style={{ background: telemetryColors.delegated }} /><span>Subagents</span><strong>execution</strong></div>
-          <p className="method-note">First content runs from message start to the first timed text or reasoning part; it includes queueing and prefill. Tool-call output is the gap from the last timed part to tool start. Neither is a provider-measured phase. Tool and subagent execution is removed from inference.</p>
+          <div className="telemetry-definitions">
+            {telemetryDefinitions.map((item) => <div className="telemetry-definition" key={item.key}>
+              <div><span className="swatch" style={{ background: telemetryColors[item.key] }} /><span>{item.label}</span><strong>{item.kind}</strong></div>
+              <p>{item.description}</p>
+            </div>)}
+          </div>
+          <p className="method-note">Each cycle sums all worker, reviewer, and retrospective model steps. Categories come from observed timestamps, not provider billing telemetry. Tool and subagent execution is removed from inference.</p>
         </article>
       </section>
 

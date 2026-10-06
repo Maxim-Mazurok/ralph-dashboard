@@ -639,7 +639,7 @@ test('matches role logs to OpenCode sessions and reports peak context and reason
     assert.equal(dashboard.cycles[0].compactionCount, 2)
     assert.equal(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.compactionCount, 2)
     assert.deepEqual(dashboard.cycles[0].artifacts.find((artifact) => artifact.name === 'worker-1.log')?.session, {
-      model: 'MODEL', maxContextTokens: 64000, contextLimit: 100000, reasoningTokens: 1200, reasoningCount: 1, compactionCount: 2,
+      model: 'MODEL', activeMs: 14000, maxContextTokens: 64000, contextLimit: 100000, reasoningTokens: 1200, reasoningCount: 1, compactionCount: 2,
       inferenceMs: 11000, toolMs: 3000, delegatedMs: 240000, firstContentMs: 1000,
       reasoningMs: 4000, outputMs: 2000, toolOutputMs: 4000, otherInferenceMs: 0,
     })

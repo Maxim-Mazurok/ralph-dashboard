@@ -142,6 +142,8 @@ export function parseOpenCodeEvents(
   let stepStart: number | null = null
   let stepLastActivity: number | null = null
   let firstContentSeen = false
+  let lastContentEnd: number | null = null
+  let firstToolStart: number | null = null
 
   for (const record of records) {
     const type = string(record.type)
@@ -162,6 +164,8 @@ export function parseOpenCodeEvents(
       stepStart = timestamp
       stepLastActivity = timestamp
       firstContentSeen = false
+      lastContentEnd = null
+      firstToolStart = null
       continue
     }
     if (stepStart !== null) stepLastActivity = Math.max(stepLastActivity || stepStart, activityAt)
@@ -169,6 +173,9 @@ export function parseOpenCodeEvents(
       const tokens = object(part.tokens)
       session.maxContextTokens = Math.max(session.maxContextTokens, Number(tokens.total) || 0)
       session.reasoningTokens += Number(tokens.reasoning) || 0
+      if (lastContentEnd !== null && firstToolStart !== null && firstToolStart > lastContentEnd) {
+        session.toolOutputMs += firstToolStart - lastContentEnd
+      }
       if (stepStart !== null && timestamp >= stepStart) steps.push({ start: stepStart, end: timestamp })
       stepStart = null
       stepLastActivity = null
@@ -191,6 +198,7 @@ export function parseOpenCodeEvents(
       if (start !== null && end !== null && end >= start) {
         if (eventType === 'reasoning') session.reasoningMs += end - start
         else session.outputMs += end - start
+        lastContentEnd = Math.max(lastContentEnd || 0, end)
       }
       if (eventType === 'reasoning') {
         session.reasoningCount++
@@ -207,6 +215,7 @@ export function parseOpenCodeEvents(
     const tool = string(part.tool, 'tool')
     if (toolStart !== null && toolEnd !== null && toolEnd >= toolStart) {
       const interval = { start: toolStart, end: toolEnd }
+      firstToolStart = firstToolStart === null ? toolStart : Math.min(firstToolStart, toolStart)
       if (tool === 'task') delegated.push(interval)
       else tools.push(interval)
     }

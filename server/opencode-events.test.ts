@@ -55,6 +55,19 @@ test('maps completed tools, delegated time, compactions, duplicates, and partial
   assert.equal(session.events.find((event) => event.tool === 'bash')?.output, 'pass')
 })
 
+test('estimates untimed tool-call output before tool execution', () => {
+  const session = parseOpenCodeEvents(lines([
+    { type: 'step_start', timestamp: 1000, sessionID: 'ses_tool_output', part: { id: 'start', type: 'step-start' } },
+    { type: 'reasoning', timestamp: 1200, sessionID: 'ses_tool_output', part: { id: 'reason', type: 'reasoning', text: 'Use a tool', time: { start: 1100, end: 1200 } } },
+    { type: 'tool_use', timestamp: 1600, sessionID: 'ses_tool_output', part: { id: 'tool', type: 'tool', tool: 'read', state: { status: 'completed', time: { start: 1500, end: 1600 } } } },
+    { type: 'step_finish', timestamp: 1700, sessionID: 'ses_tool_output', part: { id: 'finish', type: 'step-finish', tokens: { total: 20 } } },
+  ]), {})
+
+  assert(session)
+  assert.equal(session.toolOutputMs, 300)
+  assert.equal(session.otherInferenceMs, 100)
+})
+
 test('requires a valid session id from metadata or events', () => {
   assert.equal(parseOpenCodeEvents('{"type":"text","part":{"text":"orphan"}}'), null)
   assert.equal(parseOpenCodeEvents('', { session_id: 'ses_metadata' })?.id, 'ses_metadata')
