@@ -261,6 +261,37 @@ test('reports a pending retrospective as an active cycle', async () => {
   }
 })
 
+test('loads the dashboard when state references a removed active cycle', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-stale-active-'))
+  const runtime = path.join(root, '.ralph/runtime')
+  const removedCycle = path.join(runtime, 'cycle-191-1000')
+  await mkdir(runtime, { recursive: true })
+  await writeFile(path.join(runtime, 'state.json'), JSON.stringify({
+    completed: 190,
+    history: [],
+    active: { directory: removedCycle, phase: 'worker', attempt: 1, cycle: 191 },
+  }))
+
+  process.env.NODE_ENV = 'test'
+  process.env.RALPH_PROJECT_PATH = root
+  const { app } = await import(`./index.ts?stale-active=${Date.now()}`)
+  const server = createServer(app)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  assert(address && typeof address !== 'string')
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
+    assert.equal(response.status, 200)
+    const dashboard = await response.json() as { active: Record<string, unknown> | null; cycles: unknown[] }
+    assert.deepEqual(dashboard.active, { cycle: 191, phase: 'worker', attempt: 1, logFile: null })
+    assert.deepEqual(dashboard.cycles, [])
+  } finally {
+    server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('streams OpenCode tool updates when the role log is unchanged', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ralph-dashboard-live-session-'))
   const cycle = path.join(root, '.ralph/runtime/cycle-8-1000')

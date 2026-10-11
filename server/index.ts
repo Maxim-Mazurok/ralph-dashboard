@@ -376,17 +376,29 @@ async function findActiveLog(state: JsonObject | null): Promise<ActiveLog | null
 
   const preferredPhase = text(active?.phase, pending ? 'retrospective' : '')
   const preferredAttempt = Number(active?.attempt ?? pending?.attempt ?? 0)
-  const files = await readdir(directory, { withFileTypes: true })
-  const logs = await Promise.all(files.flatMap((entry) => {
-    const match = entry.isFile() ? attemptPattern.exec(entry.name) : null
-    if (!match || match[3] !== 'log') return []
-    return [stat(path.join(directory, entry.name)).then((details) => ({
-      file: entry.name,
-      phase: match[1],
-      attempt: Number(match[2]),
-      modifiedMs: details.mtimeMs,
-    }))]
-  }))
+  let files
+  try {
+    files = await readdir(directory, { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  let logs
+  try {
+    logs = await Promise.all(files.flatMap((entry) => {
+      const match = entry.isFile() ? attemptPattern.exec(entry.name) : null
+      if (!match || match[3] !== 'log') return []
+      return [stat(path.join(directory, entry.name)).then((details) => ({
+        file: entry.name,
+        phase: match[1],
+        attempt: Number(match[2]),
+        modifiedMs: details.mtimeMs,
+      }))]
+    }))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
   if (!logs.length) return null
   const preferred = logs.find((log) => log.phase === preferredPhase && log.attempt === preferredAttempt)
   const selected = preferred || logs.sort((left, right) => right.modifiedMs - left.modifiedMs)[0]
