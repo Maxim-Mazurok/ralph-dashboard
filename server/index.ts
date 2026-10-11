@@ -577,11 +577,15 @@ async function loadDashboard() {
   const state = await readJson(path.join(runtimeRoot, 'state.json'))
   const active = state?.active as JsonObject | undefined
   const pendingRetrospective = state?.pendingRetrospective as JsonObject | undefined
-  const running = active || pendingRetrospective
-  const activeLog = await findActiveLog(state)
-  const activeDirectory = running ? text(running.directory) : null
+  const candidate = active || pendingRetrospective
+  const candidateDirectory = candidate ? text(candidate.directory) : null
   const directoryEntries = await readdir(runtimeRoot, { withFileTypes: true })
   const cycleEntries = directoryEntries.filter((entry) => entry.isDirectory() && cyclePattern.test(entry.name))
+  const running = candidateDirectory && cycleEntries.some((entry) => path.join(runtimeRoot, entry.name) === candidateDirectory)
+    ? candidate
+    : undefined
+  const activeDirectory = running ? candidateDirectory : null
+  const activeLog = running ? await findActiveLog(state) : null
   const completedRecords = new Map<string, JsonObject>()
   const rememberCompleted = (entry: unknown) => {
     if (!entry || typeof entry !== 'object') return

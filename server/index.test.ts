@@ -284,7 +284,7 @@ test('loads the dashboard when state references a removed active cycle', async (
     const response = await fetch(`http://127.0.0.1:${address.port}/api/dashboard`)
     assert.equal(response.status, 200)
     const dashboard = await response.json() as { active: Record<string, unknown> | null; cycles: unknown[] }
-    assert.deepEqual(dashboard.active, { cycle: 191, phase: 'worker', attempt: 1, logFile: null })
+    assert.equal(dashboard.active, null)
     assert.deepEqual(dashboard.cycles, [])
   } finally {
     server.close()
